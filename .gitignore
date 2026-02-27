@@ -1,0 +1,26 @@
+# ROS 2 / colcon build artefacts
+colcon_ws/build/
+colcon_ws/install/
+colcon_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# Byte-compiled / optimized / DLL files
+*.pyo
+
+# VS Code
+.vscode/
+
+# Environment
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db

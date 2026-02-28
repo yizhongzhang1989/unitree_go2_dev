@@ -72,6 +72,7 @@ from unitree_sdk2py.utils.crc import CRC
 
 PosStopF: float = 2.146e9
 VelStopF: float = 16000.0
+_SINE_FREQ_RAD: float = 2.0 * math.pi  # 1 Hz
 
 # Path to the MotionSwitcher helper bundled with low_level_control_web.
 # Falls back to the copy next to the sdk example scripts if not found.
@@ -169,10 +170,6 @@ def joint_linear_interpolation(init_pos: float, target_pos: float, rate: float) 
 
 
 class Go2LowLevelNode(Node):
-    # PD gains — set during ramp phase, kept for sine phase
-    Kp = [0.0, 0.0, 0.0]
-    Kd = [0.0, 0.0, 0.0]
-
     # Sine-wave centre position: [FR_0 hip, FR_1 thigh, FR_2 calf]
     sin_mid_q = [0.0, 1.2, -2.0]
 
@@ -180,11 +177,12 @@ class Go2LowLevelNode(Node):
         super().__init__('go2_low_level_ros2')
 
         self.low_state: LowState | None = None
-        self.qInit     = [0.0, 0.0, 0.0]
-        self.qDes      = [0.0, 0.0, 0.0]
+        self.qInit      = [0.0, 0.0, 0.0]
+        self.qDes       = [0.0, 0.0, 0.0]
+        self.Kp         = [0.0, 0.0, 0.0]  # PD gains — set during ramp, kept for sine
+        self.Kd         = [0.0, 0.0, 0.0]
         self.motiontime = 0
         self.rate_count = 0
-        self.sin_count  = 0
         self._sine_start_time: float | None = None
 
         # ROS2 subscriber: /lowstate → this node
@@ -233,17 +231,14 @@ class Go2LowLevelNode(Node):
             self.qDes[2] = joint_linear_interpolation(self.qInit[2], self.sin_mid_q[2], rate)
 
         # ---- Phase 2: sinusoidal motion (ticks 400+) ----
-        freq_rad = 1.0 * 2.0 * math.pi   # 1 Hz in rad/s
-
         if self.motiontime >= 400:
             if self._sine_start_time is None:
                 self._sine_start_time = time.monotonic()
                 self.get_logger().info('Sine phase started.')
-            self.sin_count += 1
             # Wall-clock elapsed time — ensures true 1 Hz despite any loop jitter
             t = time.monotonic() - self._sine_start_time
-            sin_joint1 =  0.6 * math.sin(t * freq_rad)
-            sin_joint2 = -0.9 * math.sin(t * freq_rad)
+            sin_joint1 =  0.6 * math.sin(t * _SINE_FREQ_RAD)
+            sin_joint2 = -0.9 * math.sin(t * _SINE_FREQ_RAD)
 
             self.qDes[0] = self.sin_mid_q[0]
             self.qDes[1] = self.sin_mid_q[1] + sin_joint1

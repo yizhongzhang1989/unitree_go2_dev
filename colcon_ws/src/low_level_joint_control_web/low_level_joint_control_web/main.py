@@ -16,7 +16,7 @@ import rclpy
 import uvicorn
 
 from low_level_joint_control_web.control_node import JointControlNode
-from low_level_joint_control_web.web_server import app, set_node
+from low_level_joint_control_web.web_server import app, set_node, _ServicePoller, set_service_poller
 
 
 def main(args=None) -> None:
@@ -35,6 +35,9 @@ def main(args=None) -> None:
     rclpy.init()
     node = JointControlNode(network_interface=parsed.network_interface)
     set_node(node)
+
+    svc_poller = _ServicePoller(network_interface=parsed.network_interface)
+    set_service_poller(svc_poller)
 
     spin_thread = threading.Thread(
         target=rclpy.spin, args=(node,), daemon=True, name='rclpy_spin'

@@ -39,7 +39,16 @@ def _call_helper(*args, timeout: float = 8.0) -> dict | list:
         text=True,
         timeout=timeout,
     )
-    return json.loads(result.stdout)
+    raw = (result.stdout or '').strip()
+    # The SDK may print C-level messages to stdout before/after the JSON.
+    # Scan forward to find the first character that starts a valid JSON value.
+    for i, ch in enumerate(raw):
+        if ch in ('{', '['):
+            try:
+                return json.loads(raw[i:])
+            except json.JSONDecodeError:
+                continue
+    return {'error': (raw or result.stderr or 'no output').strip()[:300]}
 
 
 class ServiceManager:

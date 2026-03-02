@@ -1,24 +1,30 @@
 """web_server.py — FastAPI application for single-joint control dashboard.
 
 Routes:
-  GET  /                   → HTML dashboard
-  GET  /api/status         → full status JSON (joint state + control params)
-  POST /api/joint          → select active joint          {joint_idx}
-  POST /api/target         → set target position (rad)    {q}
-  POST /api/target_dq      → set target velocity (rad/s)  {dq}
-  POST /api/torque         → set feedforward torque (N·m) {tau}
-  POST /api/gains          → set PD gains                 {kp, kd}
-  POST /api/freq           → set control frequency (Hz)   {freq}
-  POST /api/enable         → enable/disable control       {enabled}
-  POST /api/estop          → activate E-stop
-  DELETE /api/estop        → clear E-stop
-  POST /api/mode/release   → release sport controller
-  POST /api/mode/restore   → restore sport controller
-  WS   /ws                 → push status JSON at ~25 Hz
+  GET  /                        → HTML dashboard
+  GET  /api/status              → full status JSON (joint state + control params)
+  POST /api/joint               → select active joint          {joint_idx}
+  POST /api/target              → set target position (rad)    {q}
+  POST /api/target_dq           → set target velocity (rad/s)  {dq}
+  POST /api/torque              → set feedforward torque (N·m) {tau}
+  POST /api/gains               → set PD gains                 {kp, kd}
+  POST /api/freq                → set control frequency (Hz)   {freq}
+  POST /api/enable              → enable/disable control       {enabled}
+  POST /api/estop               → activate E-stop
+  DELETE /api/estop             → clear E-stop
+  GET  /api/services            → current status of 4 managed services
+  POST /api/service/{name}/start → start a service by name
+  POST /api/service/{name}/stop  → stop a service by name
+  WS   /ws                      → push status JSON at ~25 Hz
 """
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from typing import Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -33,6 +39,108 @@ _node = None
 def set_node(node) -> None:
     global _node
     _node = node
+
+
+# ---------------------------------------------------------------------------
+# Service poller — manages the 4 services required for low-level control
+# ---------------------------------------------------------------------------
+
+_TARGET_SERVICES = ('mcf', 'sport_mode', 'advanced_sport', 'ai_sport')
+_HELPER = os.path.join(os.path.dirname(__file__), '_service_helper.py')
+_POLL_INTERVAL = 2.0
+_SDK_ENV = {
+    **os.environ,
+    'LD_LIBRARY_PATH': '/usr/local/lib' + (
+        (':' + os.environ['LD_LIBRARY_PATH']) if 'LD_LIBRARY_PATH' in os.environ else ''
+    ),
+}
+
+
+class _ServicePoller:
+    """Background thread that polls the 4 target services every POLL_INTERVAL seconds."""
+
+    def __init__(self, network_interface=None):
+        self._iface   = network_interface
+        self._lock    = threading.Lock()
+        self._state   = {}   # {name: {'status': int, 'protect': bool}}
+        self._error   = None
+        self._last_upd = 0.0
+        self._thread  = threading.Thread(
+            target=self._loop, daemon=True, name='svc_poller')
+        self._thread.start()
+
+    def _call_helper(self, *args):
+        cmd = [sys.executable, _HELPER] + list(args)
+        if self._iface:
+            cmd.append(self._iface)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=_SDK_ENV, timeout=10)
+        raw = (proc.stdout or '').strip()
+        # The SDK may print C-level messages to stdout before/after the JSON.
+        # Scan forward to find the first character that starts a valid JSON value.
+        for i, ch in enumerate(raw):
+            if ch in ('{', '['):
+                try:
+                    return json.loads(raw[i:])
+                except json.JSONDecodeError:
+                    continue
+        # No parseable JSON found — return error with raw output for debugging
+        return {'error': (raw or proc.stderr or 'no output').strip()[:300]}
+
+    def _poll(self):
+        try:
+            data = self._call_helper('list')
+            if isinstance(data, list):
+                state = {}
+                for s in data:
+                    if s['name'] in _TARGET_SERVICES:
+                        state[s['name']] = {
+                            'status':  s['status'],
+                            'protect': s.get('protect', False),
+                        }
+                with self._lock:
+                    self._state    = state
+                    self._error    = None
+                    self._last_upd = time.time()
+            elif 'error' in data:
+                with self._lock:
+                    self._error = data['error']
+        except Exception as exc:
+            with self._lock:
+                self._error = str(exc)
+
+    def _loop(self):
+        while True:
+            self._poll()
+            time.sleep(_POLL_INTERVAL)
+
+    def get_services(self) -> dict:
+        with self._lock:
+            return {
+                'services':    dict(self._state),
+                'error':       self._error,
+                'last_update': self._last_upd,
+            }
+
+    def switch(self, name: str, on: bool) -> dict:
+        """Start (on=True) or stop (on=False) a service. Blocks; re-polls afterwards."""
+        val = '1' if on else '0'
+        try:
+            result = self._call_helper('switch', name, val)
+        except Exception as exc:
+            return {'error': str(exc)}
+        threading.Thread(target=self._poll, daemon=True).start()
+        if result.get('code', -1) == 0:
+            return {'ok': True}
+        return {'error': result.get('error', f'code={result.get("code")}')}
+
+
+_svc_poller = None
+
+
+def set_service_poller(poller) -> None:
+    global _svc_poller
+    _svc_poller = poller
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +162,6 @@ class TorqueRequest(BaseModel):
 class GainsRequest(BaseModel):
     kp: float
     kd: float
-
-class MaxTauRequest(BaseModel):
-    max_tau: float
 
 class FreqRequest(BaseModel):
     freq: float
@@ -106,7 +211,12 @@ async def _broadcaster() -> None:
     while True:
         if _node is not None and _manager._active:
             try:
-                await _manager.broadcast(json.dumps(_node.get_status()))
+                status = _node.get_status()
+                if _svc_poller is not None:
+                    svc = _svc_poller.get_services()
+                    status['services']       = svc['services']
+                    status['services_error'] = svc['error']
+                await _manager.broadcast(json.dumps(status))
             except Exception:
                 pass
         await asyncio.sleep(0.04)  # 25 Hz
@@ -175,14 +285,6 @@ async def api_torque(req: TorqueRequest) -> JSONResponse:
     return JSONResponse({'ok': True})
 
 
-@app.post('/api/max_tau', response_class=JSONResponse)
-async def api_max_tau(req: MaxTauRequest) -> JSONResponse:
-    if _node is None:
-        return _not_ready()
-    _node.set_max_tau(req.max_tau)
-    return JSONResponse({'ok': True})
-
-
 @app.post('/api/freq', response_class=JSONResponse)
 async def api_freq(req: FreqRequest) -> JSONResponse:
     if _node is None:
@@ -215,22 +317,33 @@ async def api_estop_off() -> JSONResponse:
     return JSONResponse({'ok': True})
 
 
-@app.post('/api/mode/release', response_class=JSONResponse)
-async def api_mode_release() -> JSONResponse:
-    if _node is None:
-        return _not_ready()
-    import threading
-    threading.Thread(target=_node.release_mode, daemon=True).start()
-    return JSONResponse({'ok': True, 'state': 'releasing'})
+@app.get('/api/services', response_class=JSONResponse)
+async def api_services() -> JSONResponse:
+    if _svc_poller is None:
+        return JSONResponse({'services': {}, 'error': 'poller not ready'})
+    return JSONResponse(_svc_poller.get_services())
 
 
-@app.post('/api/mode/restore', response_class=JSONResponse)
-async def api_mode_restore() -> JSONResponse:
-    if _node is None:
-        return _not_ready()
-    import threading
-    threading.Thread(target=_node.restore_mode, daemon=True).start()
-    return JSONResponse({'ok': True, 'state': 'restoring'})
+@app.post('/api/service/{name}/start', response_class=JSONResponse)
+async def api_service_start(name: str) -> JSONResponse:
+    if name not in _TARGET_SERVICES:
+        return JSONResponse({'error': f'unknown service: {name}'}, status_code=400)
+    if _svc_poller is None:
+        return JSONResponse({'error': 'poller not ready'}, status_code=503)
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _svc_poller.switch, name, True)
+    return JSONResponse(result)
+
+
+@app.post('/api/service/{name}/stop', response_class=JSONResponse)
+async def api_service_stop(name: str) -> JSONResponse:
+    if name not in _TARGET_SERVICES:
+        return JSONResponse({'error': f'unknown service: {name}'}, status_code=400)
+    if _svc_poller is None:
+        return JSONResponse({'error': 'poller not ready'}, status_code=503)
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _svc_poller.switch, name, False)
+    return JSONResponse(result)
 
 
 @app.websocket('/ws')
@@ -400,21 +513,31 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     .btn-warning   { background: var(--yellow);  color: #000; }
     .btn-neutral   { background: #2e3147;        color: var(--text); }
 
-    /* Mode badge */
-    #mode-badge {
+    /* Service table */
+    .svc-table { width: 100%; border-collapse: collapse; }
+    .svc-table td {
+      padding: 6px 4px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      vertical-align: middle;
+    }
+    .svc-table tr:last-child td { border-bottom: none; }
+    .svc-table td:last-child { text-align: right; }
+    .svc-name { color: var(--text); font-family: monospace; width: 48%; }
+    .svc-badge {
       display: inline-block;
-      padding: 3px 10px;
-      border-radius: 20px;
-      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
       font-weight: 600;
       background: #2e3147;
       color: var(--muted);
     }
-    #mode-badge.released { background: #1c3a28; color: var(--green); }
-    #mode-badge.releasing,
-    #mode-badge.restoring { background: #3a3010; color: var(--yellow); }
-    #mode-badge.sport { background: #1a2340; color: var(--accent); }
-    #mode-badge.error { background: #3a1010; color: var(--red); }
+    .svc-badge.running { background: #1c3a28; color: var(--green); }
+    .svc-badge.stopped { background: #3a1010; color: var(--red); }
+    .svc-btn { font-size: 11px; padding: 4px 10px; flex: none; min-width: 58px; }
+    .svc-btn.stop-btn  { background: var(--red);   color: #fff; }
+    .svc-btn.start-btn { background: var(--green); color: #000; }
 
     /* Enable toggle */
     #enable-btn.on  { background: var(--green); color: #000; }
@@ -516,7 +639,6 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 <header>
   <div id="conn-dot"></div>
   <h1>Go2 — Single Joint Control</h1>
-  <span id="mode-badge">unknown</span>
 </header>
 
 <div class="main-grid">
@@ -524,13 +646,34 @@ _INDEX_HTML = r"""<!DOCTYPE html>
   <!-- ===================== LEFT: controls ===================== -->
   <div class="left-col">
 
-    <!-- Mode -->
+    <!-- Services -->
     <div class="card">
-      <div class="card-title">Sport Controller Mode</div>
-      <div class="btn-row">
-        <button class="btn-warning" id="release-btn" onclick="releaseMode()">Release</button>
-        <button class="btn-neutral" id="restore-btn" onclick="restoreMode()" disabled>Restore</button>
-      </div>
+      <div class="card-title">Required Services (must be stopped)</div>
+      <table class="svc-table">
+        <tbody>
+          <tr>
+            <td class="svc-name">mcf</td>
+            <td><span class="svc-badge" id="svc-badge-mcf">—</span></td>
+            <td><button class="svc-btn" id="svc-btn-mcf" onclick="toggleService('mcf')">?</button></td>
+          </tr>
+          <tr>
+            <td class="svc-name">sport_mode</td>
+            <td><span class="svc-badge" id="svc-badge-sport_mode">—</span></td>
+            <td><button class="svc-btn" id="svc-btn-sport_mode" onclick="toggleService('sport_mode')">?</button></td>
+          </tr>
+          <tr>
+            <td class="svc-name">advanced_sport</td>
+            <td><span class="svc-badge" id="svc-badge-advanced_sport">—</span></td>
+            <td><button class="svc-btn" id="svc-btn-advanced_sport" onclick="toggleService('advanced_sport')">?</button></td>
+          </tr>
+          <tr>
+            <td class="svc-name">ai_sport</td>
+            <td><span class="svc-badge" id="svc-badge-ai_sport">—</span></td>
+            <td><button class="svc-btn" id="svc-btn-ai_sport" onclick="toggleService('ai_sport')">?</button></td>
+          </tr>
+        </tbody>
+      </table>
+      <div id="svc-error" style="display:none;color:var(--red);font-size:12px;margin-top:8px;"></div>
     </div>
 
     <!-- Joint selector -->
@@ -606,22 +749,6 @@ _INDEX_HTML = r"""<!DOCTYPE html>
             <input type="range" id="tau-slider" min="-23" max="23" step="0.1"
                    value="0" oninput="onTauSlider(this.value)"/>
             <span class="slider-val" id="tau-slider-val" style="color:var(--yellow)">0.0</span>
-          </div>
-        </div>
-
-        <!-- max_tau clamp -->
-        <div class="slider-row" style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px;">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
-            <span style="font-size:12px;font-weight:700;color:var(--red)">&tau;<sub>max</sub> &mdash; Output Clamp (N&middot;m)</span>
-            <span style="font-size:11px;color:var(--muted)">0 = off &hellip; 23</span>
-          </div>
-          <div class="slider-value-row">
-            <input type="range" id="max-tau-slider" min="0" max="23" step="0.1"
-                   value="5" oninput="onMaxTauSlider(this.value)"/>
-            <span class="slider-val" id="max-tau-slider-val" style="color:var(--red)">5.0</span>
-          </div>
-          <div style="font-size:11px;color:var(--muted);margin-top:4px;">
-            Caps total τ = kp·err + kd·derr + τ<sub>ff</sub> to this limit. Prevents oscillation from large position errors.
           </div>
         </div>
 
@@ -739,10 +866,11 @@ _INDEX_HTML = r"""<!DOCTYPE html>
 // ============================================================
 let _enabled   = false;
 let _estop     = false;
-let _mode      = 'unknown';
 let _jointMin  = -3.14;
 let _jointMax  =  3.14;
 let _selectedJoint = 0;
+
+const SERVICES = ['mcf', 'sport_mode', 'advanced_sport', 'ai_sport'];
 
 // Chart history
 const HISTORY = 200;
@@ -780,18 +908,6 @@ connect();
 // Status update
 // ============================================================
 function onStatus(s) {
-  // Mode badge
-  _mode = s.mode_state || 'unknown';
-  const badge = document.getElementById('mode-badge');
-  badge.textContent = _mode;
-  badge.className   = '';
-  badge.classList.add(_mode);
-
-  document.getElementById('release-btn').disabled =
-    ['releasing','released','restoring'].includes(_mode);
-  document.getElementById('restore-btn').disabled =
-    !['released'].includes(_mode);
-
   // Sync joint selector on first message or joint change
   const sel = document.getElementById('joint-select');
   if (sel.options.length === 0 && s.joint_names) {
@@ -847,12 +963,6 @@ function onStatus(s) {
     document.getElementById('tau-slider').value = tv;
     document.getElementById('tau-slider-val').textContent = parseFloat(tv).toFixed(1);
   }
-  if (document.activeElement.id !== 'max-tau-slider') {
-    const mv = s.max_tau ?? 5;
-    document.getElementById('max-tau-slider').value = mv;
-    document.getElementById('max-tau-slider-val').textContent = parseFloat(mv).toFixed(1);
-  }
-
   // Gauges
   const q    = s.q    != null ? s.q    : NaN;
   const qDes = s.q_des != null ? s.q_des : NaN;
@@ -901,6 +1011,34 @@ function onStatus(s) {
 
   document.getElementById('sb-tick').textContent =
     `joint=${s.joint_idx}  actual=${isNaN(q)?'—':q.toFixed(4)} rad  target=${isNaN(qDes)?'—':qDes.toFixed(4)} rad`;
+
+  // Services
+  if (s.services) {
+    SERVICES.forEach(name => {
+      const badge = document.getElementById(`svc-badge-${name}`);
+      const btn   = document.getElementById(`svc-btn-${name}`);
+      const svc   = s.services[name];
+      if (!badge || !btn) return;
+      if (!svc) {
+        badge.textContent = '—'; badge.className = 'svc-badge';
+        btn.textContent = '?'; btn.className = 'svc-btn';
+        return;
+      }
+      const running      = svc.status === 0;  // 0=running, 1=stopped
+      badge.textContent  = running ? 'running' : 'stopped';
+      badge.className    = 'svc-badge ' + (running ? 'running' : 'stopped');
+      btn.textContent    = running ? 'Stop' : 'Start';
+      btn.className      = 'svc-btn ' + (running ? 'stop-btn' : 'start-btn');
+      btn.disabled       = svc.protect || false;
+    });
+  }
+  const errEl = document.getElementById('svc-error');
+  if (s.services_error) {
+    errEl.textContent  = 'Service error: ' + s.services_error;
+    errEl.style.display = '';
+  } else {
+    errEl.style.display = 'none';
+  }
 }
 
 function setText(id, val, unit) {
@@ -1056,11 +1194,6 @@ function onTauSlider(val) {
   post('/api/torque', {tau: parseFloat(val)});
 }
 
-function onMaxTauSlider(val) {
-  document.getElementById('max-tau-slider-val').textContent = parseFloat(val).toFixed(1);
-  post('/api/max_tau', {max_tau: parseFloat(val)});
-}
-
 function onFreqSlider(val) {
   const f = parseInt(val);
   document.getElementById('freq-val').innerHTML =
@@ -1083,14 +1216,13 @@ function clearEstop() {
   fetch('/api/estop', {method:'DELETE'}).catch(()=>{});
 }
 
-function releaseMode() {
-  if (!confirm('Release the sport controller? The robot will stand down and enter low-level mode.')) return;
-  post('/api/mode/release', {});
-}
-
-function restoreMode() {
-  if (!confirm('Restore the sport controller?')) return;
-  post('/api/mode/restore', {});
+function toggleService(name) {
+  const badge   = document.getElementById(`svc-badge-${name}`);
+  const running = badge && badge.classList.contains('running');
+  const action  = running ? 'stop' : 'start';
+  const btn     = document.getElementById(`svc-btn-${name}`);
+  if (btn) btn.disabled = true;
+  post(`/api/service/${name}/${action}`, {});
 }
 
 function post(url, body) {

@@ -1,17 +1,25 @@
 """web_server.py — FastAPI application for real-time motor status AND control.
 
 Routes:
-  GET    /                  → HTML dashboard
-  GET    /api/status        → latest LowState as JSON
-  GET    /api/control_state → current per-motor control targets + estop flag
-  POST   /api/cmd           → set target for one motor  (body: MotorCmdRequest)
-  POST   /api/estop         → activate emergency stop
-  DELETE /api/estop         → clear emergency stop
-  WS     /ws                → push {status + control} JSON at ~10 Hz
+  GET    /                       → HTML dashboard
+  GET    /api/status             → latest LowState as JSON
+  GET    /api/control_state      → current per-motor control targets + estop flag
+  POST   /api/cmd                → set target for one motor  (body: MotorCmdRequest)
+  POST   /api/estop              → activate emergency stop
+  DELETE /api/estop              → clear emergency stop
+  GET    /api/services           → current status of 4 managed services
+  POST   /api/service/{name}/start → start a service by name
+  POST   /api/service/{name}/stop  → stop a service by name
+  WS     /ws                     → push {status + control + services} JSON at ~10 Hz
 """
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from typing import Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -27,6 +35,104 @@ _status_capture = None
 def set_status_capture(capture) -> None:
     global _status_capture
     _status_capture = capture
+
+
+# ---------------------------------------------------------------------------
+# Service poller — manages the 4 services required for low-level control
+# ---------------------------------------------------------------------------
+
+_TARGET_SERVICES = ('mcf', 'sport_mode', 'advanced_sport', 'ai_sport')
+_HELPER = os.path.join(os.path.dirname(__file__), '_service_helper.py')
+_POLL_INTERVAL = 2.0
+_SDK_ENV = {
+    **os.environ,
+    'LD_LIBRARY_PATH': '/usr/local/lib' + (
+        (':' + os.environ['LD_LIBRARY_PATH']) if 'LD_LIBRARY_PATH' in os.environ else ''
+    ),
+}
+
+
+class _ServicePoller:
+    """Background thread that polls the 4 target services every POLL_INTERVAL seconds."""
+
+    def __init__(self, network_interface=None):
+        self._iface    = network_interface
+        self._lock     = threading.Lock()
+        self._state    = {}
+        self._error    = None
+        self._last_upd = 0.0
+        self._thread   = threading.Thread(
+            target=self._loop, daemon=True, name='svc_poller')
+        self._thread.start()
+
+    def _call_helper(self, *args):
+        cmd = [sys.executable, _HELPER] + list(args)
+        if self._iface:
+            cmd.append(self._iface)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=_SDK_ENV, timeout=10)
+        raw = (proc.stdout or '').strip()
+        for i, ch in enumerate(raw):
+            if ch in ('{', '['):
+                try:
+                    return json.loads(raw[i:])
+                except json.JSONDecodeError:
+                    continue
+        return {'error': (raw or proc.stderr or 'no output').strip()[:300]}
+
+    def _poll(self):
+        try:
+            data = self._call_helper('list')
+            if isinstance(data, list):
+                state = {}
+                for s in data:
+                    if s['name'] in _TARGET_SERVICES:
+                        state[s['name']] = {
+                            'status':  s['status'],
+                            'protect': s.get('protect', False),
+                        }
+                with self._lock:
+                    self._state    = state
+                    self._error    = None
+                    self._last_upd = time.time()
+            elif 'error' in data:
+                with self._lock:
+                    self._error = data['error']
+        except Exception as exc:
+            with self._lock:
+                self._error = str(exc)
+
+    def _loop(self):
+        while True:
+            self._poll()
+            time.sleep(_POLL_INTERVAL)
+
+    def get_services(self) -> dict:
+        with self._lock:
+            return {
+                'services':    dict(self._state),
+                'error':       self._error,
+                'last_update': self._last_upd,
+            }
+
+    def switch(self, name: str, on: bool) -> dict:
+        val = '1' if on else '0'
+        try:
+            result = self._call_helper('switch', name, val)
+        except Exception as exc:
+            return {'error': str(exc)}
+        threading.Thread(target=self._poll, daemon=True).start()
+        if result.get('code', -1) == 0:
+            return {'ok': True}
+        return {'error': result.get('error', f'code={result.get("code")}')}
+
+
+_svc_poller = None
+
+
+def set_service_poller(poller) -> None:
+    global _svc_poller
+    _svc_poller = poller
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +191,14 @@ async def _broadcaster() -> None:
         if _status_capture is not None and _manager._active:
             status = _status_capture.get_latest_status()
             ctrl   = _status_capture.get_control_state()
-            mode   = _status_capture.get_mode_state()
             if status is not None:
                 try:
-                    await _manager.broadcast(json.dumps({**status, 'control': ctrl, 'mode': mode}))
+                    payload = {**status, 'control': ctrl}
+                    if _svc_poller is not None:
+                        svc = _svc_poller.get_services()
+                        payload['services']       = svc['services']
+                        payload['services_error'] = svc['error']
+                    await _manager.broadcast(json.dumps(payload))
                 except Exception:
                     pass
         await asyncio.sleep(0.1)
@@ -149,29 +259,33 @@ async def api_estop_off() -> JSONResponse:
     return JSONResponse({'ok': True, 'estop': False})
 
 
-@app.get('/api/mode', response_class=JSONResponse)
-async def api_mode() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    return JSONResponse(_status_capture.get_mode_state())
+@app.get('/api/services', response_class=JSONResponse)
+async def api_services() -> JSONResponse:
+    if _svc_poller is None:
+        return JSONResponse({'services': {}, 'error': 'poller not ready'})
+    return JSONResponse(_svc_poller.get_services())
 
 
-@app.post('/api/mode/release', response_class=JSONResponse)
-async def api_mode_release() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    import threading
-    threading.Thread(target=_status_capture.release_mode, daemon=True).start()
-    return JSONResponse({'ok': True, 'state': 'releasing'})
+@app.post('/api/service/{name}/start', response_class=JSONResponse)
+async def api_service_start(name: str) -> JSONResponse:
+    if name not in _TARGET_SERVICES:
+        return JSONResponse({'error': f'unknown service: {name}'}, status_code=400)
+    if _svc_poller is None:
+        return JSONResponse({'error': 'poller not ready'}, status_code=503)
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _svc_poller.switch, name, True)
+    return JSONResponse(result)
 
 
-@app.post('/api/mode/restore', response_class=JSONResponse)
-async def api_mode_restore() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    import threading
-    threading.Thread(target=_status_capture.restore_mode, daemon=True).start()
-    return JSONResponse({'ok': True, 'state': 'restoring'})
+@app.post('/api/service/{name}/stop', response_class=JSONResponse)
+async def api_service_stop(name: str) -> JSONResponse:
+    if name not in _TARGET_SERVICES:
+        return JSONResponse({'error': f'unknown service: {name}'}, status_code=400)
+    if _svc_poller is None:
+        return JSONResponse({'error': 'poller not ready'}, status_code=503)
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _svc_poller.switch, name, False)
+    return JSONResponse(result)
 
 
 @app.websocket('/ws')
@@ -190,7 +304,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 # HTML dashboard
 # ---------------------------------------------------------------------------
 
-_INDEX_HTML = """<!DOCTYPE html>
+_INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
@@ -198,574 +312,695 @@ _INDEX_HTML = """<!DOCTYPE html>
   <title>Go2 — Low-Level Motor Control</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
     :root {
-      --bg:       #0d1117; --surface: #161b22; --border: #30363d;
-      --text:     #e6edf3; --muted:   #8b949e; --accent: #58a6ff;
-      --green:    #3fb950; --yellow:  #d29922; --red:    #f85149;
-      --purple:   #bc8cff; --ctrl-bg: #0d1f0d;
+      --bg:      #0f1117;
+      --surface: #1a1d27;
+      --border:  #2e3147;
+      --accent:  #4f8ef7;
+      --green:   #3ecf6e;
+      --red:     #e05252;
+      --yellow:  #f0c050;
+      --text:    #e2e4ed;
+      --muted:   #6b7280;
+      --radius:  10px;
     }
-    body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif;
-           padding:1.2rem 1rem 3rem; min-height:100vh; }
 
-    /* ---- header ---- */
-    header { display:flex; align-items:center; justify-content:space-between;
-             margin-bottom:1.2rem; flex-wrap:wrap; gap:.5rem; }
-    header h1 { font-size:1.3rem; font-weight:600; color:var(--accent); letter-spacing:.04em; }
-    header p  { font-size:.78rem; color:var(--muted); }
-    .header-right { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
 
-    #status-badge { font-size:.72rem; padding:.2rem .55rem; border-radius:999px;
-                    border:1px solid var(--border); background:var(--surface); color:var(--muted); }
-    #status-badge.live { border-color:var(--green); color:var(--green); }
-    #status-badge.err  { border-color:var(--red);   color:var(--red);   }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+    #conn-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--muted); flex-shrink: 0;
+      transition: background .3s;
+    }
+    #conn-dot.live { background: var(--green); }
 
-    .btn-estop { background:var(--red); color:#fff; border:none; border-radius:6px;
-                 padding:.35rem .9rem; font-size:.8rem; font-weight:700; cursor:pointer;
-                 letter-spacing:.04em; transition:opacity .15s; }
-    .btn-estop:hover { opacity:.85; }
-    .btn-estop.cleared { background:#21262d; color:var(--muted); font-weight:400; }
+    /* Service chips */
+    .svc-strip { display: flex; align-items: center; gap: .3rem; flex-wrap: wrap; margin-left: 4px; }
+    .svc-strip-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .svc-chip {
+      font-size: 11px; padding: 2px 8px; border-radius: 4px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+      white-space: nowrap; transition: all .15s;
+    }
+    .svc-chip:hover { opacity: .85; }
+    .svc-chip.running { border-color: var(--green); color: var(--green); }
+    .svc-chip.stopped { border-color: var(--red);   color: var(--red);   }
 
-    .mode-badge { font-size:.72rem; padding:.2rem .55rem; border-radius:999px;
-                  border:1px solid var(--border); background:var(--surface); color:var(--muted); }
-    .mode-badge.sport   { border-color:var(--muted);   color:var(--muted);   }
-    .mode-badge.active  { border-color:var(--green);   color:var(--green);   }
-    .mode-badge.busy    { border-color:var(--yellow);  color:var(--yellow);  }
-    .mode-badge.errored { border-color:var(--red);     color:var(--red);     }
+    /* E-stop header button */
+    #hdr-estop {
+      margin-left: auto;
+      padding: 6px 14px;
+      border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 700; cursor: pointer;
+      background: var(--red); color: #fff;
+      transition: opacity .15s;
+      white-space: nowrap;
+    }
+    #hdr-estop:hover { opacity: .85; }
+    #hdr-estop.cleared { background: #2e3147; color: var(--muted); font-weight: 400; }
 
-    .btn-mode { font-size:.75rem; padding:.28rem .65rem; border-radius:5px; cursor:pointer;
-                border:1px solid var(--yellow); background:transparent; color:var(--yellow);
-                font-weight:600; transition:all .15s; }
-    .btn-mode:hover:not(:disabled) { background:var(--yellow); color:#000; }
-    .btn-mode.released { border-color:var(--green); color:var(--green); }
-    .btn-mode.released:hover:not(:disabled) { background:var(--green); color:#000; }
-    .btn-mode:disabled  { border-color:var(--border); color:var(--muted); cursor:not-allowed; }
+    .main-grid {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 20px;
+      padding: 20px 24px;
+      flex: 1;
+    }
 
-    /* ---- section ---- */
-    .section-title { font-size:.72rem; font-weight:600; letter-spacing:.08em;
-                     text-transform:uppercase; color:var(--muted); margin:1.3rem 0 .65rem; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+    }
+    .card-title {
+      font-size: 11px; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 12px;
+    }
 
-    /* ---- motor grid ---- */
-    .motor-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:.7rem; }
+    /* Left column */
+    .left-col { display: flex; flex-direction: column; gap: 14px; }
 
-    .motor-card { background:var(--surface); border:1px solid var(--border);
-                  border-radius:8px; padding:.7rem .9rem; transition:border-color .2s; }
-    .motor-card.warn  { border-color:var(--yellow); }
-    .motor-card.error { border-color:var(--red); }
-    .motor-card.active { border-color:var(--green); }
+    select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 8px 10px;
+      font-size: 14px;
+      outline: none;
+    }
+    select:focus { border-color: var(--accent); }
 
-    .card-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:.45rem; }
-    .motor-name  { font-size:.8rem; font-weight:600; }
-    .card-badges { display:flex; gap:.3rem; align-items:center; }
-    .motor-idx   { font-size:.68rem; color:var(--muted); }
-    .ctrl-badge  { font-size:.62rem; padding:.1rem .35rem; border-radius:3px;
-                   background:var(--green); color:#000; font-weight:700; display:none; }
+    /* Sliders */
+    .slider-row { display: flex; flex-direction: column; gap: 6px; }
+    .slider-value-row { display: flex; align-items: center; gap: 10px; }
+    input[type=range] {
+      flex: 1; accent-color: var(--accent);
+      cursor: pointer; height: 6px;
+    }
+    .slider-val {
+      min-width: 60px; text-align: right;
+      font-size: 15px; font-weight: 600; color: var(--accent);
+    }
 
-    .motor-row { display:flex; justify-content:space-between; font-size:.76rem;
-                 padding:.13rem 0; border-bottom:1px solid #21262d; }
-    .motor-row:last-child { border-bottom:none; }
-    .motor-row .label { color:var(--muted); }
-    .motor-row .value { font-variant-numeric:tabular-nums; font-weight:500; }
-    .motor-row .value.hot    { color:var(--red); }
-    .motor-row .value.warm   { color:var(--yellow); }
-    .motor-row .value.normal { color:var(--green); }
+    /* Service table */
+    .svc-table { width: 100%; border-collapse: collapse; }
+    .svc-table td {
+      padding: 5px 3px; border-bottom: 1px solid var(--border);
+      font-size: 12px; vertical-align: middle;
+    }
+    .svc-table tr:last-child td { border-bottom: none; }
+    .svc-table td:last-child { text-align: right; }
+    .svc-name { color: var(--text); font-family: monospace; width: 50%; }
+    .svc-badge {
+      display: inline-block; padding: 2px 7px; border-radius: 10px;
+      font-size: 10px; font-weight: 600;
+      background: #2e3147; color: var(--muted);
+    }
+    .svc-badge.running { background: #1c3a28; color: var(--green); }
+    .svc-badge.stopped { background: #3a1010; color: var(--red); }
+    .svc-btn { font-size: 10px; padding: 3px 9px; flex: none; min-width: 52px;
+               border-radius: 4px; border: none; cursor: pointer; font-weight: 600; }
+    .svc-btn.stop-btn  { background: var(--red);   color: #fff; }
+    .svc-btn.start-btn { background: var(--green); color: #000; }
+    .svc-btn:disabled  { opacity: .45; cursor: not-allowed; }
 
-    /* ---- control section ---- */
-    .ctrl-divider { border:none; border-top:1px solid #21262d; margin:.5rem 0 .4rem; }
+    /* Buttons */
+    .btn-row { display: flex; gap: 10px; }
+    button { cursor: pointer; transition: opacity .15s, filter .15s; }
+    button:hover { filter: brightness(1.12); }
+    button:active { filter: brightness(.9); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
 
-    .ctrl-toggle-row { display:flex; justify-content:space-between; align-items:center; }
-    .ctrl-toggle-row .label { font-size:.72rem; color:var(--muted); letter-spacing:.04em;
-                               text-transform:uppercase; }
+    #enable-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+    }
+    #enable-btn.on  { background: var(--green); color: #000; }
+    #enable-btn.off { background: #2e3147;      color: var(--text); }
 
-    .btn-toggle { font-size:.7rem; padding:.2rem .55rem; border-radius:4px; cursor:pointer;
-                  border:1px solid var(--border); background:#21262d; color:var(--muted);
-                  transition:all .15s; }
-    .btn-toggle.on { border-color:var(--green); background:#0d1f0d; color:var(--green); font-weight:600; }
+    #estop-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 700; letter-spacing: .04em;
+      background: var(--red); color: #fff;
+    }
+    #clear-estop-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+      background: #2e3147; color: var(--text);
+    }
 
-    .ctrl-fields { margin-top:.4rem; display:none; }
-    .ctrl-fields.visible { display:block; }
+    /* Right column — motor card grid */
+    .right-col { display: flex; flex-direction: column; gap: 14px; }
+    .motor-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
 
-    .ctrl-row { display:flex; align-items:center; gap:.3rem; margin-bottom:.3rem; }
-    .ctrl-row label { font-size:.7rem; color:var(--muted); width:80px; flex-shrink:0; }
-    .ctrl-row input { flex:1; background:#21262d; border:1px solid var(--border);
-                      border-radius:4px; color:var(--text); font-size:.75rem;
-                      padding:.2rem .35rem; min-width:0; }
-    .ctrl-row input:focus { outline:none; border-color:var(--accent); }
-    .btn-copy { font-size:.62rem; padding:.15rem .3rem; border-radius:3px; cursor:pointer;
-                border:1px solid var(--border); background:#21262d; color:var(--muted);
-                white-space:nowrap; }
-    .btn-copy:hover { color:var(--text); }
+    .motor-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: border-color .2s;
+    }
+    .motor-card:hover { border-color: #4a5080; }
+    .motor-card.selected  { border-color: var(--accent); }
+    .motor-card.enabled   { border-color: var(--green);  }
+    .motor-card.estopped  { border-color: var(--red);    }
 
-    .ctrl-gains { display:grid; grid-template-columns:1fr 1fr; gap:.3rem; margin-bottom:.4rem; }
-    .gain-group label { font-size:.68rem; color:var(--muted); display:block; margin-bottom:.15rem; }
-    .gain-group input { width:100%; background:#21262d; border:1px solid var(--border);
-                        border-radius:4px; color:var(--text); font-size:.75rem; padding:.2rem .35rem; }
-    .gain-group input:focus { outline:none; border-color:var(--accent); }
+    .mc-header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 6px;
+    }
+    .mc-name { font-size: 12px; font-weight: 600; }
+    .mc-badges { display: flex; gap: 4px; align-items: center; }
+    .mc-idx  { font-size: 10px; color: var(--muted); }
+    .mc-ctrl-badge {
+      font-size: 9px; padding: 1px 5px; border-radius: 3px;
+      background: var(--green); color: #000; font-weight: 700; display: none;
+    }
 
-    .ctrl-btns { display:flex; gap:.4rem; margin-top:.1rem; }
-    .btn-send { flex:1; font-size:.75rem; padding:.28rem; border-radius:4px; cursor:pointer;
-                border:none; background:var(--accent); color:#000; font-weight:600; transition:opacity .15s; }
-    .btn-send:hover { opacity:.85; }
-    .btn-disable { font-size:.72rem; padding:.28rem .55rem; border-radius:4px; cursor:pointer;
-                   border:1px solid var(--border); background:#21262d; color:var(--muted); }
-    .btn-disable:hover { color:var(--red); border-color:var(--red); }
+    .mc-row {
+      display: flex; justify-content: space-between;
+      font-size: 11px; padding: 2px 0;
+      border-bottom: 1px solid #21252f;
+    }
+    .mc-row:last-child { border-bottom: none; }
+    .mc-row .lbl { color: var(--muted); }
+    .mc-row .val { font-variant-numeric: tabular-nums; font-weight: 500; }
+    .val.hot    { color: var(--red); }
+    .val.warm   { color: var(--yellow); }
+    .val.normal { color: var(--green); }
 
-    /* ---- system panels ---- */
-    .panels { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:.7rem; }
-    .panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:.7rem .9rem; }
-    .panel .panel-title { font-size:.72rem; font-weight:600; color:var(--accent);
-                          margin-bottom:.4rem; letter-spacing:.04em; }
-    .panel .panel-row { display:flex; justify-content:space-between; font-size:.78rem;
-                        padding:.13rem 0; border-bottom:1px solid #21262d; }
-    .panel .panel-row:last-child { border-bottom:none; }
-    .panel .panel-row .label { color:var(--muted); }
-    .panel .panel-row .value { font-variant-numeric:tabular-nums; font-weight:500; }
-    .panel .panel-row .value.hot    { color:var(--red); }
-    .panel .panel-row .value.warm   { color:var(--yellow); }
-    .panel .panel-row .value.normal { color:var(--green); }
-
-    .cell-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:3px; margin-top:.3rem; }
-    .cell-box { background:#21262d; border-radius:3px; text-align:center;
-                font-size:.62rem; padding:.15rem .1rem; font-variant-numeric:tabular-nums; }
-    .cell-box.low { color:var(--red); } .cell-box.mid { color:var(--yellow); } .cell-box.ok { color:var(--green); }
-
-    .update-rate { font-size:.68rem; color:var(--muted); text-align:right; margin-top:.4rem; }
+    #status-bar {
+      padding: 8px 24px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      font-size: 12px; color: var(--muted);
+      display: flex; gap: 24px;
+    }
   </style>
 </head>
 <body>
 
 <header>
-  <div>
-    <h1>Unitree Go2 — Low-Level Motor Control</h1>
-    <p>Real-time monitor &amp; control via ROS2 <code>/lowstate</code> / <code>/lowcmd</code></p>
+  <div id="conn-dot"></div>
+  <h1>Go2 — Low-Level Motor Control</h1>
+  <div class="svc-strip">
+    <span class="svc-strip-label">Services:</span>
+    <button class="svc-chip" id="svc-btn-mcf"            onclick="toggleService('mcf')">mcf: ?</button>
+    <button class="svc-chip" id="svc-btn-sport_mode"     onclick="toggleService('sport_mode')">sport_mode: ?</button>
+    <button class="svc-chip" id="svc-btn-advanced_sport" onclick="toggleService('advanced_sport')">advanced_sport: ?</button>
+    <button class="svc-chip" id="svc-btn-ai_sport"       onclick="toggleService('ai_sport')">ai_sport: ?</button>
   </div>
-  <div class="header-right">
-    <span id="status-badge">&#9679;&nbsp;Connecting…</span>
-    <span id="mode-badge" class="mode-badge">● Mode: unknown</span>
-    <button id="mode-btn" class="btn-mode" onclick="modeAction()">Release Mode</button>
-    <button class="btn-estop cleared" id="estop-btn" onclick="toggleEstop()">⚠ E-STOP</button>
-  </div>
+  <button id="hdr-estop" class="cleared" onclick="toggleEstop()">&#9888; E-STOP</button>
 </header>
 
-<div class="section-title">Motors (12 joints)</div>
-<div class="motor-grid" id="motor-grid"></div>
+<div class="main-grid">
 
-<div class="section-title">System</div>
-<div class="panels">
-  <div class="panel">
-    <div class="panel-title">IMU</div>
-    <div class="panel-row"><span class="label">Roll</span>   <span class="value" id="imu-roll">—</span></div>
-    <div class="panel-row"><span class="label">Pitch</span>  <span class="value" id="imu-pitch">—</span></div>
-    <div class="panel-row"><span class="label">Yaw</span>    <span class="value" id="imu-yaw">—</span></div>
-    <div class="panel-row"><span class="label">Quat w</span> <span class="value" id="imu-qw">—</span></div>
-    <div class="panel-row"><span class="label">Quat x</span> <span class="value" id="imu-qx">—</span></div>
-    <div class="panel-row"><span class="label">Quat y</span> <span class="value" id="imu-qy">—</span></div>
-    <div class="panel-row"><span class="label">Quat z</span> <span class="value" id="imu-qz">—</span></div>
-    <div class="panel-row"><span class="label">Gyro X</span> <span class="value" id="imu-gx">—</span></div>
-    <div class="panel-row"><span class="label">Gyro Y</span> <span class="value" id="imu-gy">—</span></div>
-    <div class="panel-row"><span class="label">Gyro Z</span> <span class="value" id="imu-gz">—</span></div>
-    <div class="panel-row"><span class="label">Acc X</span>  <span class="value" id="imu-ax">—</span></div>
-    <div class="panel-row"><span class="label">Acc Y</span>  <span class="value" id="imu-ay">—</span></div>
-    <div class="panel-row"><span class="label">Acc Z</span>  <span class="value" id="imu-az">—</span></div>
-    <div class="panel-row"><span class="label">Temp</span>   <span class="value" id="imu-temp">—</span></div>
+  <!-- ======== LEFT: controls ======== -->
+  <div class="left-col">
+
+    <!-- Services -->
+    <div class="card">
+      <div class="card-title">Required Services (must be stopped)</div>
+      <table class="svc-table"><tbody>
+        <tr>
+          <td class="svc-name">mcf</td>
+          <td><span class="svc-badge" id="svc-badge-mcf">—</span></td>
+          <td><button class="svc-btn" id="svc-tbtn-mcf" onclick="toggleService('mcf')">?</button></td>
+        </tr>
+        <tr>
+          <td class="svc-name">sport_mode</td>
+          <td><span class="svc-badge" id="svc-badge-sport_mode">—</span></td>
+          <td><button class="svc-btn" id="svc-tbtn-sport_mode" onclick="toggleService('sport_mode')">?</button></td>
+        </tr>
+        <tr>
+          <td class="svc-name">advanced_sport</td>
+          <td><span class="svc-badge" id="svc-badge-advanced_sport">—</span></td>
+          <td><button class="svc-btn" id="svc-tbtn-advanced_sport" onclick="toggleService('advanced_sport')">?</button></td>
+        </tr>
+        <tr>
+          <td class="svc-name">ai_sport</td>
+          <td><span class="svc-badge" id="svc-badge-ai_sport">—</span></td>
+          <td><button class="svc-btn" id="svc-tbtn-ai_sport" onclick="toggleService('ai_sport')">?</button></td>
+        </tr>
+      </tbody></table>
+      <div id="svc-error" style="display:none;color:var(--red);font-size:11px;margin-top:6px;"></div>
+    </div>
+
+    <!-- Joint selector -->
+    <div class="card">
+      <div class="card-title">Joint Selection</div>
+      <select id="joint-select" onchange="selectJoint(parseInt(this.value))"></select>
+    </div>
+
+    <!-- Motor command parameters — 5 sliders -->
+    <div class="card">
+      <div class="card-title">Motor Command Parameters</div>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+
+        <!-- q -->
+        <div class="slider-row">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:var(--accent)">q &mdash; Position (rad)</span>
+            <span style="font-size:11px;color:var(--muted)" id="q-range-lbl">—</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="q-slider" min="-3.14" max="3.14" step="0.01"
+                   value="0" oninput="onQSlider(this.value)"/>
+            <span class="slider-val" id="q-slider-val">0.00</span>
+          </div>
+        </div>
+
+        <!-- dq -->
+        <div class="slider-row">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:#a78bfa">dq &mdash; Velocity (rad/s)</span>
+            <span style="font-size:11px;color:var(--muted)">&minus;20 &hellip; +20</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="dq-slider" min="-20" max="20" step="0.1"
+                   value="0" oninput="onDqSlider(this.value)"/>
+            <span class="slider-val" id="dq-slider-val" style="color:#a78bfa">0.0</span>
+          </div>
+        </div>
+
+        <!-- kp -->
+        <div class="slider-row">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:var(--text)">Kp &mdash; Position Gain</span>
+            <span style="font-size:11px;color:var(--muted)">0 &hellip; 100</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="kp-slider" min="0" max="100" step="0.5"
+                   value="60" oninput="onKpSlider(this.value)"/>
+            <span class="slider-val" id="kp-slider-val" style="color:var(--text)">60.0</span>
+          </div>
+        </div>
+
+        <!-- kd -->
+        <div class="slider-row">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:var(--muted)">Kd &mdash; Damping Gain</span>
+            <span style="font-size:11px;color:var(--muted)">0 &hellip; 10</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="kd-slider" min="0" max="10" step="0.05"
+                   value="5" oninput="onKdSlider(this.value)"/>
+            <span class="slider-val" id="kd-slider-val" style="color:var(--muted)">5.00</span>
+          </div>
+        </div>
+
+        <!-- tau -->
+        <div class="slider-row">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:var(--yellow)">&tau; &mdash; Torque FF (N&middot;m)</span>
+            <span style="font-size:11px;color:var(--muted)">&minus;23 &hellip; +23</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="tau-slider" min="-23" max="23" step="0.1"
+                   value="0" oninput="onTauSlider(this.value)"/>
+            <span class="slider-val" id="tau-slider-val" style="color:var(--yellow)">0.0</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Control output -->
+    <div class="card">
+      <div class="card-title">Control Output</div>
+      <div class="btn-row" style="flex-direction:column;gap:10px;">
+        <button id="enable-btn" class="off" onclick="toggleEnable()">Enable Motor</button>
+        <button id="estop-btn" onclick="triggerEstop()">&#9940; EMERGENCY STOP</button>
+        <button id="clear-estop-btn" onclick="clearEstop()" style="display:none">Clear E-stop</button>
+      </div>
+    </div>
+
   </div>
 
-  <div class="panel">
-    <div class="panel-title">Foot Force</div>
-    <div class="panel-row"><span class="label">FR raw</span>      <span class="value" id="ff-0">—</span></div>
-    <div class="panel-row"><span class="label">FL raw</span>      <span class="value" id="ff-1">—</span></div>
-    <div class="panel-row"><span class="label">RR raw</span>      <span class="value" id="ff-2">—</span></div>
-    <div class="panel-row"><span class="label">RL raw</span>      <span class="value" id="ff-3">—</span></div>
-    <div class="panel-row"><span class="label">FR estimated</span><span class="value" id="ffe-0">—</span></div>
-    <div class="panel-row"><span class="label">FL estimated</span><span class="value" id="ffe-1">—</span></div>
-    <div class="panel-row"><span class="label">RR estimated</span><span class="value" id="ffe-2">—</span></div>
-    <div class="panel-row"><span class="label">RL estimated</span><span class="value" id="ffe-3">—</span></div>
+  <!-- ======== RIGHT: 12 motor cards ======== -->
+  <div class="right-col">
+    <div class="card" style="padding:14px 16px;">
+      <div class="card-title">All Motor States — click a card to select joint</div>
+      <div class="motor-grid" id="motor-grid"></div>
+    </div>
   </div>
 
-  <div class="panel">
-    <div class="panel-title">Power &amp; System</div>
-    <div class="panel-row"><span class="label">Voltage</span>    <span class="value" id="pwr-v">—</span></div>
-    <div class="panel-row"><span class="label">Current</span>    <span class="value" id="pwr-a">—</span></div>
-    <div class="panel-row"><span class="label">NTC1 temp</span>  <span class="value" id="ntc1">—</span></div>
-    <div class="panel-row"><span class="label">NTC2 temp</span>  <span class="value" id="ntc2">—</span></div>
-    <div class="panel-row"><span class="label">Fan 0</span>      <span class="value" id="fan0">—</span></div>
-    <div class="panel-row"><span class="label">Fan 1</span>      <span class="value" id="fan1">—</span></div>
-    <div class="panel-row"><span class="label">Fan 2</span>      <span class="value" id="fan2">—</span></div>
-    <div class="panel-row"><span class="label">Fan 3</span>      <span class="value" id="fan3">—</span></div>
-    <div class="panel-row"><span class="label">Level flag</span> <span class="value" id="level-flag">—</span></div>
-    <div class="panel-row"><span class="label">Bit flag</span>   <span class="value" id="bit-flag">—</span></div>
-    <div class="panel-row"><span class="label">Bandwidth</span>  <span class="value" id="bandwidth">—</span></div>
-    <div class="panel-row"><span class="label">ADC reel</span>   <span class="value" id="adc-reel">—</span></div>
-    <div class="panel-row"><span class="label">Tick</span>       <span class="value" id="pwr-tick">—</span></div>
-  </div>
-
-  <div class="panel">
-    <div class="panel-title">Battery (BMS)</div>
-    <div class="panel-row"><span class="label">State of Charge</span><span class="value" id="bms-soc">—</span></div>
-    <div class="panel-row"><span class="label">Current</span>        <span class="value" id="bms-cur">—</span></div>
-    <div class="panel-row"><span class="label">Cycle count</span>    <span class="value" id="bms-cyc">—</span></div>
-    <div class="panel-row"><span class="label">Status</span>         <span class="value" id="bms-sta">—</span></div>
-    <div class="panel-row"><span class="label">Firmware</span>       <span class="value" id="bms-ver">—</span></div>
-    <div class="panel-row"><span class="label">BQ NTC 0</span>       <span class="value" id="bms-bqntc0">—</span></div>
-    <div class="panel-row"><span class="label">BQ NTC 1</span>       <span class="value" id="bms-bqntc1">—</span></div>
-    <div class="panel-row"><span class="label">MCU NTC 0</span>      <span class="value" id="bms-mcuntc0">—</span></div>
-    <div class="panel-row"><span class="label">MCU NTC 1</span>      <span class="value" id="bms-mcuntc1">—</span></div>
-    <div style="margin-top:.35rem;font-size:.68rem;color:var(--muted)">Cell voltages (mV)</div>
-    <div class="cell-grid" id="bms-cells"></div>
-  </div>
 </div>
 
-<div class="update-rate" id="update-rate">Last update: —</div>
+<div id="status-bar">
+  <span id="sb-conn">WebSocket: connecting…</span>
+  <span id="sb-tick">—</span>
+</div>
 
 <script>
+// ============================================================
+// Constants
+// ============================================================
 const MOTOR_NAMES = [
   'FR_0 hip','FR_1 thigh','FR_2 calf',
   'FL_0 hip','FL_1 thigh','FL_2 calf',
   'RR_0 hip','RR_1 thigh','RR_2 calf',
   'RL_0 hip','RL_1 thigh','RL_2 calf',
 ];
-const LEG_COLOR = [
-  '#58a6ff','#58a6ff','#58a6ff',
-  '#3fb950','#3fb950','#3fb950',
-  '#d29922','#d29922','#d29922',
-  '#bc8cff','#bc8cff','#bc8cff',
+const LEG_COLORS = [
+  '#4f8ef7','#4f8ef7','#4f8ef7',
+  '#3ecf6e','#3ecf6e','#3ecf6e',
+  '#f0c050','#f0c050','#f0c050',
+  '#a78bfa','#a78bfa','#a78bfa',
+];
+// [min_rad, max_rad] per joint
+const JOINT_LIMITS = [
+  [-1.05, 1.05], [-1.57, 3.14], [-2.72, -0.84],
+  [-1.05, 1.05], [-1.57, 3.14], [-2.72, -0.84],
+  [-1.05, 1.05], [-1.57, 3.14], [-2.72, -0.84],
+  [-1.05, 1.05], [-1.57, 3.14], [-2.72, -0.84],
 ];
 
-// ---- Build motor cards ----
+// ============================================================
+// State
+// ============================================================
+let _selectedJoint = 0;
+let _enabled       = false;   // enabled state of selected joint
+let _estop         = false;
+let _ctrlMotors    = [];       // per-motor control state from server
+
+// ============================================================
+// Build motor cards
+// ============================================================
 function buildMotorCards() {
   const grid = document.getElementById('motor-grid');
   for (let i = 0; i < 12; i++) {
     const card = document.createElement('div');
     card.className = 'motor-card';
     card.id = `mc-${i}`;
+    card.onclick = () => selectJoint(i);
     card.innerHTML = `
-      <div class="card-header">
-        <span class="motor-name" style="color:${LEG_COLOR[i]}">${MOTOR_NAMES[i]}</span>
-        <div class="card-badges">
-          <span class="ctrl-badge" id="cbadge-${i}">CTRL</span>
-          <span class="motor-idx">#${i}</span>
+      <div class="mc-header">
+        <span class="mc-name" style="color:${LEG_COLORS[i]}">${MOTOR_NAMES[i]}</span>
+        <div class="mc-badges">
+          <span class="mc-ctrl-badge" id="mc-cbadge-${i}">CTRL</span>
+          <span class="mc-idx">#${i}</span>
         </div>
       </div>
-
-      <div class="motor-row"><span class="label">Mode</span>               <span class="value" id="m${i}-mode">—</span></div>
-      <div class="motor-row"><span class="label">q (rad)</span>            <span class="value" id="m${i}-q">—</span></div>
-      <div class="motor-row"><span class="label">dq (rad/s)</span>         <span class="value" id="m${i}-dq">—</span></div>
-      <div class="motor-row"><span class="label">ddq (rad/s²)</span>       <span class="value" id="m${i}-ddq">—</span></div>
-      <div class="motor-row"><span class="label">τ_est (Nm)</span>         <span class="value" id="m${i}-tau">—</span></div>
-      <div class="motor-row"><span class="label">q_raw (rad)</span>        <span class="value" id="m${i}-qr">—</span></div>
-      <div class="motor-row"><span class="label">dq_raw (rad/s)</span>     <span class="value" id="m${i}-dqr">—</span></div>
-      <div class="motor-row"><span class="label">ddq_raw (rad/s²)</span>   <span class="value" id="m${i}-ddqr">—</span></div>
-      <div class="motor-row"><span class="label">Temperature (°C)</span>   <span class="value" id="m${i}-temp">—</span></div>
-      <div class="motor-row"><span class="label">Lost frames</span>        <span class="value" id="m${i}-lost">—</span></div>
-
-      <hr class="ctrl-divider"/>
-
-      <div class="ctrl-toggle-row">
-        <span class="label">Control</span>
-        <button class="btn-toggle" id="ctog-${i}" onclick="toggleEnable(${i})">Enable</button>
-      </div>
-
-      <div class="ctrl-fields" id="cfields-${i}">
-        <div class="ctrl-row" style="margin-top:.4rem">
-          <label>q target (rad)</label>
-          <input type="number" step="0.01" id="ci-${i}-q" value="0">
-          <button class="btn-copy" title="Copy current q" onclick="copyQ(${i})">← cur</button>
-        </div>
-        <div class="ctrl-row">
-          <label>dq target (rad/s)</label>
-          <input type="number" step="0.01" id="ci-${i}-dq" value="0">
-        </div>
-        <div class="ctrl-row">
-          <label>τ feedfwd (Nm)</label>
-          <input type="number" step="0.1" id="ci-${i}-tau" value="0">
-        </div>
-        <div class="ctrl-gains">
-          <div class="gain-group">
-            <label>kp (Nm/rad)</label>
-            <input type="number" step="1" id="ci-${i}-kp" value="60">
-          </div>
-          <div class="gain-group">
-            <label>kd (Nm·s/rad)</label>
-            <input type="number" step="0.1" id="ci-${i}-kd" value="5">
-          </div>
-        </div>
-        <div class="ctrl-btns">
-          <button class="btn-send" onclick="sendCmd(${i})">Send Command</button>
-          <button class="btn-disable" onclick="disableMotor(${i})">Disable</button>
-        </div>
-      </div>
+      <div class="mc-row"><span class="lbl">q (rad)</span>    <span class="val" id="mc-q-${i}">—</span></div>
+      <div class="mc-row"><span class="lbl">dq (rad/s)</span> <span class="val" id="mc-dq-${i}">—</span></div>
+      <div class="mc-row"><span class="lbl">&tau;_est (Nm)</span><span class="val" id="mc-tau-${i}">—</span></div>
+      <div class="mc-row"><span class="lbl">Temp (°C)</span>  <span class="val" id="mc-temp-${i}">—</span></div>
     `;
     grid.appendChild(card);
   }
 }
 
-function buildBmsCells() {
-  const g = document.getElementById('bms-cells');
-  for (let i = 0; i < 15; i++) {
-    const b = document.createElement('div');
-    b.className = 'cell-box'; b.id = `cell-${i}`; b.textContent = '—';
-    g.appendChild(b);
+// ============================================================
+// Joint selection
+// ============================================================
+function selectJoint(idx) {
+  _selectedJoint = idx;
+  document.getElementById('joint-select').value = idx;
+  updateSliderLimits(idx);
+  syncSlidersFromCtrl(idx);
+  updateCardBorders();
+}
+
+function updateSliderLimits(idx) {
+  const [lo, hi] = JOINT_LIMITS[idx];
+  const sl = document.getElementById('q-slider');
+  sl.min = lo; sl.max = hi; sl.step = 0.01;
+  document.getElementById('q-range-lbl').textContent =
+    `${lo.toFixed(2)} … ${hi.toFixed(2)} rad`;
+  // clamp slider value
+  let v = parseFloat(sl.value);
+  v = Math.max(lo, Math.min(hi, v));
+  sl.value = v;
+  document.getElementById('q-slider-val').textContent = v.toFixed(2);
+}
+
+function syncSlidersFromCtrl(idx) {
+  if (!_ctrlMotors[idx]) return;
+  const c = _ctrlMotors[idx];
+  if (document.activeElement.id !== 'q-slider') {
+    document.getElementById('q-slider').value = c.q ?? 0;
+    document.getElementById('q-slider-val').textContent = parseFloat(c.q ?? 0).toFixed(2);
+  }
+  if (document.activeElement.id !== 'dq-slider') {
+    document.getElementById('dq-slider').value = c.dq ?? 0;
+    document.getElementById('dq-slider-val').textContent = parseFloat(c.dq ?? 0).toFixed(1);
+  }
+  if (document.activeElement.id !== 'kp-slider') {
+    document.getElementById('kp-slider').value = c.kp ?? 60;
+    document.getElementById('kp-slider-val').textContent = parseFloat(c.kp ?? 60).toFixed(1);
+  }
+  if (document.activeElement.id !== 'kd-slider') {
+    document.getElementById('kd-slider').value = c.kd ?? 5;
+    document.getElementById('kd-slider-val').textContent = parseFloat(c.kd ?? 5).toFixed(2);
+  }
+  if (document.activeElement.id !== 'tau-slider') {
+    document.getElementById('tau-slider').value = c.tau ?? 0;
+    document.getElementById('tau-slider-val').textContent = parseFloat(c.tau ?? 0).toFixed(1);
   }
 }
 
-// ---- Helpers ----
-function tempClass(t) { return t >= 70 ? 'hot' : t >= 50 ? 'warm' : 'normal'; }
-function set(id, text) { const e = document.getElementById(id); if (e) e.textContent = text; }
-function setClass(id, cls, text) {
-  const e = document.getElementById(id); if (!e) return;
-  e.textContent = text; e.className = 'value ' + cls;
-}
-function val(id) { return parseFloat(document.getElementById(id).value) || 0; }
-
-// ---- Status rendering ----
-function updateMotors(motors, ctrl) {
-  const estop = ctrl ? ctrl.estop : false;
+function updateCardBorders() {
   for (let i = 0; i < 12; i++) {
-    const m = motors[i];
-    const t = m.temperature;
-    const enabled = ctrl && ctrl.motors[i].enabled;
     const card = document.getElementById(`mc-${i}`);
-    card.className = 'motor-card'
-      + (estop ? ' error' : enabled ? ' active' : t >= 70 ? ' error' : t >= 50 ? ' warn' : '');
-
-    set(`m${i}-mode`, m.mode);
-    set(`m${i}-q`,    m.q.toFixed(4));
-    set(`m${i}-dq`,   m.dq.toFixed(4));
-    set(`m${i}-ddq`,  m.ddq.toFixed(4));
-    set(`m${i}-tau`,  m.tau_est.toFixed(4));
-    set(`m${i}-qr`,   m.q_raw.toFixed(4));
-    set(`m${i}-dqr`,  m.dq_raw.toFixed(4));
-    set(`m${i}-ddqr`, m.ddq_raw.toFixed(4));
-    setClass(`m${i}-temp`, tempClass(t), t + ' °C');
-    setClass(`m${i}-lost`, m.lost > 0 ? 'hot' : '', m.lost);
-
-    // Sync control toggle UI.
-    // Rule: show panel if server says enabled OR user has locally opened it.
-    // Only collapse if server says disabled AND user has NOT locally opened it.
-    const tog = document.getElementById(`ctog-${i}`);
-    const fields = document.getElementById(`cfields-${i}`);
-    const badge = document.getElementById(`cbadge-${i}`);
-    if (tog) {
-      const showPanel = enabled || !!_localPanelOpen[i];
-      if (showPanel) {
-        tog.textContent = 'Enabled'; tog.className = 'btn-toggle on';
-        fields.className = 'ctrl-fields visible';
-        badge.style.display = 'inline';
-        // Once the server confirms enabled, the local flag is no longer needed.
-        if (enabled) delete _localPanelOpen[i];
-      } else {
-        tog.textContent = 'Enable'; tog.className = 'btn-toggle';
-        fields.className = 'ctrl-fields';
-        badge.style.display = 'none';
-      }
-    }
+    if (!card) continue;
+    const en = _ctrlMotors[i] && _ctrlMotors[i].enabled;
+    if (_estop)           card.className = 'motor-card estopped';
+    else if (i === _selectedJoint) card.className = 'motor-card selected' + (en ? ' enabled' : '');
+    else if (en)          card.className = 'motor-card enabled';
+    else                  card.className = 'motor-card';
   }
 }
 
-function updateIMU(imu) {
-  const r2d = v => (v * 180 / Math.PI).toFixed(2) + ' °';
-  set('imu-roll',  r2d(imu.rpy[0])); set('imu-pitch', r2d(imu.rpy[1])); set('imu-yaw', r2d(imu.rpy[2]));
-  set('imu-qw', imu.quaternion[0].toFixed(6)); set('imu-qx', imu.quaternion[1].toFixed(6));
-  set('imu-qy', imu.quaternion[2].toFixed(6)); set('imu-qz', imu.quaternion[3].toFixed(6));
-  set('imu-gx', imu.gyroscope[0].toFixed(4) + ' rad/s');
-  set('imu-gy', imu.gyroscope[1].toFixed(4) + ' rad/s');
-  set('imu-gz', imu.gyroscope[2].toFixed(4) + ' rad/s');
-  set('imu-ax', imu.accelerometer[0].toFixed(4) + ' m/s²');
-  set('imu-ay', imu.accelerometer[1].toFixed(4) + ' m/s²');
-  set('imu-az', imu.accelerometer[2].toFixed(4) + ' m/s²');
-  setClass('imu-temp', tempClass(imu.temperature), imu.temperature + ' °C');
-}
-
-function updateFootForce(ff, ffe) {
-  ff.forEach((v, i)  => set(`ff-${i}`,  v));
-  ffe.forEach((v, i) => set(`ffe-${i}`, v));
-}
-
-function updatePower(d) {
-  set('pwr-v',    d.power_v.toFixed(3) + ' V');
-  set('pwr-a',    d.power_a.toFixed(3) + ' A');
-  setClass('ntc1', tempClass(d.temperature_ntc1), d.temperature_ntc1 + ' °C');
-  setClass('ntc2', tempClass(d.temperature_ntc2), d.temperature_ntc2 + ' °C');
-  set('fan0', d.fan_frequency[0] + ' Hz'); set('fan1', d.fan_frequency[1] + ' Hz');
-  set('fan2', d.fan_frequency[2] + ' Hz'); set('fan3', d.fan_frequency[3] + ' Hz');
-  set('level-flag', '0x' + d.level_flag.toString(16).padStart(2,'0'));
-  set('bit-flag',   '0x' + d.bit_flag.toString(16).padStart(2,'0'));
-  set('bandwidth',  d.bandwidth);
-  set('adc-reel',   d.adc_reel.toFixed(4));
-  set('pwr-tick',   d.tick);
-}
-
-function updateBMS(bms) {
-  const socEl = document.getElementById('bms-soc');
-  socEl.textContent = bms.soc + ' %';
-  socEl.className = 'value ' + (bms.soc <= 20 ? 'hot' : bms.soc <= 40 ? 'warm' : 'normal');
-  set('bms-cur', bms.current + ' mA'); set('bms-cyc', bms.cycle);
-  set('bms-sta', '0x' + bms.status.toString(16).padStart(2,'0'));
-  set('bms-ver', bms.version);
-  setClass('bms-bqntc0',  tempClass(bms.bq_ntc[0]),  bms.bq_ntc[0]  + ' °C');
-  setClass('bms-bqntc1',  tempClass(bms.bq_ntc[1]),  bms.bq_ntc[1]  + ' °C');
-  setClass('bms-mcuntc0', tempClass(bms.mcu_ntc[0]), bms.mcu_ntc[0] + ' °C');
-  setClass('bms-mcuntc1', tempClass(bms.mcu_ntc[1]), bms.mcu_ntc[1] + ' °C');
-  bms.cell_vol.forEach((v, i) => {
-    const b = document.getElementById(`cell-${i}`); if (!b) return;
-    b.textContent = v; b.className = 'cell-box ' + (v < 3000 ? 'low' : v < 3500 ? 'mid' : 'ok');
-  });
-}
-
-function updateEstopUI(estop) {
-  const btn = document.getElementById('estop-btn');
-  if (estop) {
-    btn.textContent = '⚠ E-STOP ACTIVE — Click to Clear';
-    btn.className = 'btn-estop';
-  } else {
-    btn.textContent = '⚠ E-STOP';
-    btn.className = 'btn-estop cleared';
-  }
-}
-
-function updateMode(mode) {
-  if (!mode) return;
-  const badge = document.getElementById('mode-badge');
-  const btn   = document.getElementById('mode-btn');
-  const s = mode.state;
-  const busy = s === 'releasing' || s === 'restoring';
-  const labels = {
-    sport:     ['● Sport Mode',          'sport',   'Release Mode'],
-    releasing: ['⟳ Releasing…',          'busy',    'Releasing…'],
-    released:  ['● Low-Level Active',    'active',  'Restore Mode'],
-    restoring: ['⟳ Restoring…',          'busy',    'Restoring…'],
-    error:     ['✕ Mode Error',          'errored', 'Retry Release'],
-    unknown:   ['● Mode: unknown',       '',        'Release Mode'],
-  };
-  const [badgeTxt, badgeCls, btnTxt] = labels[s] || labels.unknown;
-  badge.textContent = badgeTxt;
-  badge.className = 'mode-badge' + (badgeCls ? ' ' + badgeCls : '');
-  btn.textContent = btnTxt;
-  btn.disabled = busy;
-  btn.className = 'btn-mode' + (s === 'released' ? ' released' : '');
-}
-
-async function modeAction() {
-  const s = document.getElementById('mode-badge').className;
-  if (s.includes('active')) {
-    await apiPost('/api/mode/restore', {});
-  } else {
-    await apiPost('/api/mode/release', {});
-  }
-}
-
-// ---- Control helpers ----
-let _estopActive = false;
-// Tracks which motor panels the user has locally opened (not yet confirmed by server).
-// This prevents the 10 Hz WS update from collapsing a panel the user just opened.
-const _localPanelOpen = {};
-
-async function apiPost(url, body) {
-  const r = await fetch(url, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
-  });
-  return r.json();
-}
-async function apiDelete(url) {
-  const r = await fetch(url, { method: 'DELETE' });
-  return r.json();
-}
-
-function toggleEnable(i) {
-  const tog = document.getElementById(`ctog-${i}`);
-  const currently = tog.classList.contains('on');
-  if (currently) {
-    disableMotor(i);
-  } else {
-    // Mark panel as locally open so the WS update loop won't collapse it.
-    _localPanelOpen[i] = true;
-    // Show fields immediately — user configures then clicks Send
-    tog.textContent = 'Enabled'; tog.className = 'btn-toggle on';
-    document.getElementById(`cfields-${i}`).className = 'ctrl-fields visible';
-    document.getElementById(`cbadge-${i}`).style.display = 'inline';
-    // Pre-fill q target with current q reading
-    const curQ = document.getElementById(`m${i}-q`).textContent;
-    if (curQ !== '—') document.getElementById(`ci-${i}-q`).value = parseFloat(curQ).toFixed(4);
-  }
-}
-
-function copyQ(i) {
-  const curQ = document.getElementById(`m${i}-q`).textContent;
-  if (curQ !== '—') document.getElementById(`ci-${i}-q`).value = parseFloat(curQ).toFixed(4);
-}
-
-async function sendCmd(i) {
-  const body = {
-    motor_idx: i, enabled: true,
-    q:   val(`ci-${i}-q`),
-    dq:  val(`ci-${i}-dq`),
-    tau: val(`ci-${i}-tau`),
-    kp:  val(`ci-${i}-kp`),
-    kd:  val(`ci-${i}-kd`),
-  };
-  const r = await apiPost('/api/cmd', body);
-  if (!r.ok) alert('Command failed: ' + JSON.stringify(r));
-}
-
-async function disableMotor(i) {
-  delete _localPanelOpen[i];  // clear local flag so WS update can collapse panel
-  await apiPost('/api/cmd', { motor_idx: i, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
-  document.getElementById(`ctog-${i}`).textContent = 'Enable';
-  document.getElementById(`ctog-${i}`).className = 'btn-toggle';
-  document.getElementById(`cfields-${i}`).className = 'ctrl-fields';
-  document.getElementById(`cbadge-${i}`).style.display = 'none';
-}
-
-async function toggleEstop() {
-  if (_estopActive) {
-    await apiDelete('/api/estop');
-  } else {
-    await apiPost('/api/estop', {});
-  }
-}
-
-// ---- WebSocket ----
-const badge = document.getElementById('status-badge');
-let ws, reconnectTimer, hzTimer;
-let updateCount = 0, lastHz = 0;
-
+// ============================================================
+// WebSocket
+// ============================================================
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => {
-    badge.textContent = '● LIVE'; badge.className = 'live';
-    clearTimeout(reconnectTimer);
-    updateCount = 0;
-    hzTimer = setInterval(() => { lastHz = updateCount; updateCount = 0; }, 1000);
-  };
-  ws.onmessage = (ev) => {
-    updateCount++;
-    try {
-      const d = JSON.parse(ev.data);
-      const ctrl = d.control || null;
-      _estopActive = ctrl ? ctrl.estop : false;
-      updateMotors(d.motors, ctrl);
-      updateIMU(d.imu);
-      updateFootForce(d.foot_force, d.foot_force_est);
-      updatePower(d);
-      updateBMS(d.bms);
-      updateEstopUI(_estopActive);
-      if (d.mode) updateMode(d.mode);
-      document.getElementById('update-rate').textContent =
-        `Last update: ${new Date().toLocaleTimeString()}  |  ~${lastHz} Hz`;
-    } catch(e) { console.warn('parse error', e); }
-  };
+  const ws  = new WebSocket(`ws://${location.host}/ws`);
+  const dot = document.getElementById('conn-dot');
+  const sb  = document.getElementById('sb-conn');
+  ws.onopen = () => { dot.classList.add('live'); sb.textContent = 'WebSocket: live'; };
+  ws.onmessage = e => { try { onStatus(JSON.parse(e.data)); } catch {} };
   ws.onclose = () => {
-    badge.textContent = '● Reconnecting…'; badge.className = 'err';
-    clearInterval(hzTimer);
-    reconnectTimer = setTimeout(connect, 2000);
+    dot.classList.remove('live');
+    sb.textContent = 'WebSocket: reconnecting…';
+    setTimeout(connect, 1500);
   };
-  ws.onerror = () => { badge.textContent = '● Error'; badge.className = 'err'; ws.close(); };
+}
+connect();
+
+// ============================================================
+// Status update
+// ============================================================
+function onStatus(s) {
+  const ctrl = s.control || {};
+  _estop = ctrl.estop || false;
+  _ctrlMotors = ctrl.motors || _ctrlMotors;
+  _enabled = (_ctrlMotors[_selectedJoint] || {}).enabled || false;
+
+  // Motor cards
+  (s.motors || []).forEach((m, i) => {
+    const tc = m.temperature >= 70 ? 'hot' : m.temperature >= 50 ? 'warm' : 'normal';
+    setVal(`mc-q-${i}`,   m.q   != null ? m.q.toFixed(4) : '—');
+    setVal(`mc-dq-${i}`,  m.dq  != null ? m.dq.toFixed(4) : '—');
+    setVal(`mc-tau-${i}`, m.tau_est != null ? m.tau_est.toFixed(3) : '—');
+    setValClass(`mc-temp-${i}`, tc, m.temperature != null ? m.temperature + ' °C' : '—');
+    const badge = document.getElementById(`mc-cbadge-${i}`);
+    if (badge) badge.style.display = (_ctrlMotors[i] && _ctrlMotors[i].enabled) ? 'inline' : 'none';
+  });
+  updateCardBorders();
+
+  // Sync sliders for selected joint (only if not being dragged)
+  syncSlidersFromCtrl(_selectedJoint);
+
+  // Enable button
+  const ebtn = document.getElementById('enable-btn');
+  ebtn.textContent = _enabled ? 'Disable Motor' : 'Enable Motor';
+  ebtn.className   = _enabled ? 'on' : 'off';
+
+  // E-stop buttons
+  document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
+  document.getElementById('clear-estop-btn').style.display = _estop ? '' : 'none';
+  const hdr = document.getElementById('hdr-estop');
+  if (_estop) {
+    hdr.textContent = '⚠ E-STOP ACTIVE — Click to Clear';
+    hdr.className = '';
+  } else {
+    hdr.textContent = '⚠ E-STOP';
+    hdr.className = 'cleared';
+  }
+
+  // Services
+  if (s.services) updateServices(s.services);
+  const errEl = document.getElementById('svc-error');
+  if (s.services_error) { errEl.textContent = 'Service error: ' + s.services_error; errEl.style.display = ''; }
+  else { errEl.style.display = 'none'; }
+
+  document.getElementById('sb-tick').textContent =
+    `joint=${_selectedJoint}  q=${(s.motors||[])[_selectedJoint]?.q?.toFixed(4) ?? '—'} rad  ctrl_q=${(_ctrlMotors[_selectedJoint]||{}).q?.toFixed(4) ?? '—'} rad`;
 }
 
-buildMotorCards();
-buildBmsCells();
-connect();
+function setVal(id, text) {
+  const el = document.getElementById(id); if (el) el.textContent = text;
+}
+function setValClass(id, cls, text) {
+  const el = document.getElementById(id); if (!el) return;
+  el.textContent = text; el.className = 'val ' + cls;
+}
+
+// ============================================================
+// Service controls
+// ============================================================
+function updateServices(services) {
+  const SVCS = ['mcf', 'sport_mode', 'advanced_sport', 'ai_sport'];
+  SVCS.forEach(name => {
+    const chip = document.getElementById(`svc-btn-${name}`);
+    const badge = document.getElementById(`svc-badge-${name}`);
+    const tbtn  = document.getElementById(`svc-tbtn-${name}`);
+    const svc = services[name];
+    if (!svc) return;
+    const running = svc.status === 0;
+    if (chip) {
+      chip.textContent = `${name}: ${running ? 'running' : 'stopped'}`;
+      chip.className   = 'svc-chip ' + (running ? 'running' : 'stopped');
+    }
+    if (badge) {
+      badge.textContent = running ? 'running' : 'stopped';
+      badge.className   = 'svc-badge ' + (running ? 'running' : 'stopped');
+    }
+    if (tbtn) {
+      tbtn.textContent = running ? 'Stop' : 'Start';
+      tbtn.className   = 'svc-btn ' + (running ? 'stop-btn' : 'start-btn');
+      tbtn.disabled    = svc.protect || false;
+    }
+  });
+}
+
+function toggleService(name) {
+  const btn     = document.getElementById(`svc-btn-${name}`);
+  const running = btn && btn.classList.contains('running');
+  const action  = running ? 'stop' : 'start';
+  const tbtn    = document.getElementById(`svc-tbtn-${name}`);
+  if (btn)  btn.disabled  = true;
+  if (tbtn) tbtn.disabled = true;
+  post(`/api/service/${name}/${action}`, {});
+}
+
+// ============================================================
+// Slider handlers — immediately send command (enable=true)
+// ============================================================
+function onQSlider(val) {
+  document.getElementById('q-slider-val').textContent = parseFloat(val).toFixed(2);
+  sendCmd({ q: parseFloat(val) });
+}
+function onDqSlider(val) {
+  document.getElementById('dq-slider-val').textContent = parseFloat(val).toFixed(1);
+  sendCmd({ dq: parseFloat(val) });
+}
+function onKpSlider(val) {
+  document.getElementById('kp-slider-val').textContent = parseFloat(val).toFixed(1);
+  sendCmd({ kp: parseFloat(val) });
+}
+function onKdSlider(val) {
+  document.getElementById('kd-slider-val').textContent = parseFloat(val).toFixed(2);
+  sendCmd({ kd: parseFloat(val) });
+}
+function onTauSlider(val) {
+  document.getElementById('tau-slider-val').textContent = parseFloat(val).toFixed(1);
+  sendCmd({ tau: parseFloat(val) });
+}
+
+function sendCmd(overrides) {
+  const c = _ctrlMotors[_selectedJoint] || {};
+  post('/api/cmd', {
+    motor_idx: _selectedJoint,
+    enabled:   true,
+    q:   overrides.q   ?? parseFloat(document.getElementById('q-slider').value),
+    dq:  overrides.dq  ?? parseFloat(document.getElementById('dq-slider').value),
+    kp:  overrides.kp  ?? parseFloat(document.getElementById('kp-slider').value),
+    kd:  overrides.kd  ?? parseFloat(document.getElementById('kd-slider').value),
+    tau: overrides.tau ?? parseFloat(document.getElementById('tau-slider').value),
+  });
+}
+
+// ============================================================
+// Enable / E-stop
+// ============================================================
+function toggleEnable() {
+  if (_estop) return;
+  if (_enabled) {
+    post('/api/cmd', { motor_idx: _selectedJoint, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
+  } else {
+    sendCmd({});
+  }
+}
+
+function triggerEstop() {
+  if (confirm('Activate emergency stop?')) post('/api/estop', {});
+}
+
+function clearEstop() {
+  fetch('/api/estop', { method: 'DELETE' }).catch(() => {});
+}
+
+function toggleEstop() {
+  if (_estop) clearEstop();
+  else triggerEstop();
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+function post(url, body) {
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+// ============================================================
+// Init
+// ============================================================
+(function init() {
+  // Build joint selector dropdown
+  const sel = document.getElementById('joint-select');
+  for (let i = 0; i < 12; i++) {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = `${i}: ${MOTOR_NAMES[i]}`;
+    sel.appendChild(o);
+  }
+  buildMotorCards();
+  updateSliderLimits(0);
+})();
 </script>
 </body>
 </html>

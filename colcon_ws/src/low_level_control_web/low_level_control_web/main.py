@@ -19,10 +19,15 @@ import rclpy
 import uvicorn
 
 from low_level_control_web.status_node import ControlNode
-from low_level_control_web.web_server import app, set_status_capture
+from low_level_control_web.web_server import app, set_status_capture, _ServicePoller, set_service_poller
 
 
 def main(args=None) -> None:
+    # Strip ROS2 argument block so argparse doesn't choke on it.
+    argv = list(args or sys.argv[1:])
+    if '--ros-args' in argv:
+        argv = argv[:argv.index('--ros-args')]
+
     parser = argparse.ArgumentParser(
         description='Go2 low-level motor status & control web dashboard'
     )
@@ -38,12 +43,15 @@ def main(args=None) -> None:
         '--network-interface', default=None, dest='network_interface',
         help='Network interface for Unitree SDK DDS (e.g. eth0). Optional.',
     )
-    parsed = parser.parse_args(args)
+    parsed = parser.parse_args(argv)
 
     # Initialise rclpy and create the control node.
     rclpy.init()
     node = ControlNode(network_interface=parsed.network_interface)
     set_status_capture(node)
+
+    svc_poller = _ServicePoller(network_interface=parsed.network_interface)
+    set_service_poller(svc_poller)
 
     # Spin rclpy in a daemon background thread so uvicorn can own the main thread.
     spin_thread = threading.Thread(

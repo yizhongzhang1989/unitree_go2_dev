@@ -172,18 +172,20 @@ class ControlNode(Node):
             mc.mode = 0x01
             if i < 12 and not estop and cmds[i]['enabled']:
                 # Active control: step the q interpolation toward the target.
-                # This mirrors the example's smooth percent ramp so there are no
-                # sharp position jumps.
-                c   = cmds[i]
-                inp = interp[i]
+                c      = cmds[i]
+                inp    = interp[i]
                 inp['step'] = min(inp['step'] + 1, inp['total'])
-                pct = inp['step'] / inp['total']
-                q_cmd = (1.0 - pct) * inp['q_from'] + pct * inp['q_target']
-                mc.q   = float(q_cmd)
-                mc.dq  = float(c['dq'])
+                pct    = inp['step'] / inp['total']
+                q_cmd  = (1.0 - pct) * inp['q_from'] + pct * inp['q_target']
+                kp_val = float(c['kp'])
+                kd_val = float(c['kd'])
+                # Sentinel: tell firmware to ignore position/velocity when
+                # the corresponding gain is zero (prevents residual damping).
+                mc.q   = POS_STOP_F if kp_val < 0.01 else float(q_cmd)
+                mc.dq  = VEL_STOP_F if kd_val < 0.01 else float(c['dq'])
                 mc.tau = float(c['tau'])
-                mc.kp  = float(c['kp'])
-                mc.kd  = float(c['kd'])
+                mc.kp  = kp_val
+                mc.kd  = kd_val
             elif i < 12 and estop:
                 # E-stop: light damping, no position term
                 mc.q   = POS_STOP_F
@@ -267,8 +269,8 @@ class ControlNode(Node):
                 'motors': [dict(c) for c in self._motor_cmds],
             }
 
-    # Default interpolation duration at 50 Hz: 1 second = 50 steps.
-    INTERP_STEPS: int = 50
+    # Default interpolation duration at 50 Hz: 0.1 second = 5 steps.
+    INTERP_STEPS: int = 5
 
     def set_motor_cmd(self, idx: int, q: float, dq: float, tau: float,
                       kp: float, kd: float, enabled: bool) -> None:

@@ -14,7 +14,7 @@ import sys
 import uvicorn
 
 from common.config import load_config
-from service_web.service_manager import ServiceManager
+from common.service_client import ServiceClient as ServiceManager
 from service_web.web_server import app, set_manager
 
 

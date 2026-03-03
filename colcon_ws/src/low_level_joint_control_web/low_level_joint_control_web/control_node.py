@@ -22,7 +22,8 @@ import rclpy
 from rclpy.node import Node
 from unitree_go.msg import LowCmd, LowState, MotorCmd
 
-_MSC_HELPER = str(Path(__file__).parent / '_msc_helper.py')
+import common._msc_helper as _msc_module
+_MSC_HELPER = str(Path(_msc_module.__file__).resolve())
 _SDK_ENV = {
     **os.environ,
     'LD_LIBRARY_PATH': '/usr/local/lib:' + os.environ.get('LD_LIBRARY_PATH', ''),

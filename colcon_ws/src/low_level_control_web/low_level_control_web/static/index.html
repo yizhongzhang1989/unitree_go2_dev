@@ -309,14 +309,17 @@
     }
     .gauge-unit { font-size: 10px; color: var(--muted); margin-left: 2px; }
 
-    /* ---- Signal-history charts ---- */
-    .chart-block { display: flex; flex-direction: column; gap: 0; }
-    .chart-row   { display: flex; flex-direction: column; gap: 4px; padding-bottom: 10px; }
-    .chart-row:last-child { padding-bottom: 0; }
-    .chart-label { font-size: 10px; font-weight: 600; letter-spacing: .06em;
-                   text-transform: uppercase; color: var(--muted); }
-    .chart-wrap  { height: 110px; position: relative; }
-    .chart-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 4px; }
+    /* ---- All-motor plots inside motor cards ---- */
+    .mc-plots { display: none; margin-top: 6px; }
+    .motor-grid.show-plots .mc-plots { display: block; }
+    .mc-plot-row { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
+    .mc-plot-lbl {
+      font-size: 8px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+      color: var(--muted); width: 22px; flex-shrink: 0;
+    }
+    .mc-plot-wrap { height: 40px; flex: 1; position: relative; }
+    .mc-plot-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -335,6 +338,7 @@
     <span class="svc-strip-label">View:</span>
     <button class="toggle-btn" id="toggle-ext-btn" onclick="toggleExtended()">Extended Motors</button>
     <button class="toggle-btn" id="toggle-sys-btn" onclick="toggleSystem()">System Info</button>
+    <button class="toggle-btn" id="toggle-plot-btn" onclick="togglePlots()">Motor Plots</button>
   </div>
   <button id="hdr-estop" class="cleared" onclick="toggleEstop()">&#9888; E-STOP</button>
 </header>
@@ -485,62 +489,6 @@
       <div class="motor-grid" id="motor-grid"></div>
     </div>
 
-    <!-- Live gauges for the selected motor -->
-    <div class="card">
-      <div class="card-title" id="gauges-title">Live Gauges &mdash; Motor 0</div>
-      <div class="gauge-grid">
-        <div class="gauge">
-          <div class="gauge-label">q actual</div>
-          <div class="gauge-value" id="g-q-act">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">q target</div>
-          <div class="gauge-value" id="g-q-tgt">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">q error</div>
-          <div class="gauge-value" id="g-q-err">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">velocity</div>
-          <div class="gauge-value" id="g-dq">&#x2014;</div>
-          <div class="gauge-unit">rad/s</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">&tau; est</div>
-          <div class="gauge-value" id="g-tau">&#x2014;</div>
-          <div class="gauge-unit">N&middot;m</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">temp</div>
-          <div class="gauge-value" id="g-temp">&#x2014;</div>
-          <div class="gauge-unit">&deg;C</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Signal-history charts for the selected motor -->
-    <div class="card">
-      <div class="card-title" id="charts-title">Signal History &mdash; Motor 0</div>
-      <div class="chart-block">
-        <div class="chart-row">
-          <div class="chart-label">Position (rad)</div>
-          <div class="chart-wrap"><canvas id="chart-q"></canvas></div>
-        </div>
-        <div class="chart-row">
-          <div class="chart-label">Velocity (rad/s)</div>
-          <div class="chart-wrap"><canvas id="chart-dq"></canvas></div>
-        </div>
-        <div class="chart-row">
-          <div class="chart-label">Torque est (N&middot;m)</div>
-          <div class="chart-wrap"><canvas id="chart-tau"></canvas></div>
-        </div>
-      </div>
-    </div>
-
   </div>
 
 </div>
@@ -655,7 +603,11 @@ let _estop         = false;
 let _ctrlMotors    = [];
 let _showExtended  = false;
 let _showSystem    = false;
-let _histQActual = [], _histQTarget = [], _histDq = [], _histTau = [];
+let _showPlots     = false;
+// Per-motor signal history (12 motors × 4 signals)
+let _histQ   = Array.from({length:12}, () => []);
+let _histDq  = Array.from({length:12}, () => []);
+let _histTau = Array.from({length:12}, () => []);
 
 // ============================================================
 // Build motor cards
@@ -685,7 +637,12 @@ function buildMotorCards() {
       '<div class="mc-row ext-row"><span class="lbl">q_raw</span>        <span class="val" id="mc-qraw-' + i + '">—</span></div>' +
       '<div class="mc-row ext-row"><span class="lbl">dq_raw</span>       <span class="val" id="mc-dqraw-' + i + '">—</span></div>' +
       '<div class="mc-row ext-row"><span class="lbl">ddq_raw</span>      <span class="val" id="mc-ddqraw-' + i + '">—</span></div>' +
-      '<div class="mc-row ext-row"><span class="lbl">Lost frames</span>  <span class="val" id="mc-lost-' + i + '">—</span></div>';
+      '<div class="mc-row ext-row"><span class="lbl">Lost frames</span>  <span class="val" id="mc-lost-' + i + '">—</span></div>' +
+      '<div class="mc-plots">' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">pos</span><div class="mc-plot-wrap"><canvas id="mc-chart-q-' + i + '"></canvas></div></div>' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">vel</span><div class="mc-plot-wrap"><canvas id="mc-chart-dq-' + i + '"></canvas></div></div>' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">&tau;</span><div class="mc-plot-wrap"><canvas id="mc-chart-tau-' + i + '"></canvas></div></div>' +
+      '</div>';
     grid.appendChild(card);
   }
 }
@@ -705,6 +662,13 @@ function toggleSystem() {
   document.getElementById('toggle-sys-btn').classList.toggle('active', _showSystem);
 }
 
+function togglePlots() {
+  _showPlots = !_showPlots;
+  document.getElementById('motor-grid').classList.toggle('show-plots', _showPlots);
+  document.getElementById('toggle-plot-btn').classList.toggle('active', _showPlots);
+  if (_showPlots) drawAllCharts();
+}
+
 // ============================================================
 // Joint selection
 // ============================================================
@@ -714,12 +678,6 @@ function selectJoint(idx) {
   updateSliderLimits(idx);
   syncSlidersFromCtrl(idx);
   updateCardBorders();
-  // Clear signal history when switching joints
-  _histQActual.length = _histQTarget.length = _histDq.length = _histTau.length = 0;
-  drawAllCharts();
-  const title = 'Motor ' + idx + ' — ' + MOTOR_NAMES[idx];
-  document.getElementById('gauges-title').textContent  = 'Live Gauges — ' + title;
-  document.getElementById('charts-title').textContent  = 'Signal History — ' + title;
 }
 
 function updateSliderLimits(idx) {
@@ -873,12 +831,16 @@ function onStatus(s) {
   setGauge('g-tau',  selMot.tau_est != null ? selMot.tau_est : null, 3);
   setGauge('g-temp', selMot.temperature != null ? selMot.temperature : null, 1);
 
-  // Signal history
-  if (qAct != null) { _histQActual.push(qAct);  if (_histQActual.length > CHART_HISTORY) _histQActual.shift(); }
-  if (qTgt != null) { _histQTarget.push(qTgt);  if (_histQTarget.length > CHART_HISTORY) _histQTarget.shift(); }
-  if (selMot.dq != null)      { _histDq.push(selMot.dq);       if (_histDq.length  > CHART_HISTORY) _histDq.shift(); }
-  if (selMot.tau_est != null) { _histTau.push(selMot.tau_est); if (_histTau.length > CHART_HISTORY) _histTau.shift(); }
-  drawAllCharts();
+  // Per-motor signal history (all 12)
+  const allMotors = s.motors || [];
+  for (let i = 0; i < 12; i++) {
+    const m = allMotors[i];
+    if (!m) continue;
+    if (m.q       != null) { _histQ[i].push(m.q);       if (_histQ[i].length   > CHART_HISTORY) _histQ[i].shift(); }
+    if (m.dq      != null) { _histDq[i].push(m.dq);     if (_histDq[i].length  > CHART_HISTORY) _histDq[i].shift(); }
+    if (m.tau_est != null) { _histTau[i].push(m.tau_est); if (_histTau[i].length > CHART_HISTORY) _histTau[i].shift(); }
+  }
+  if (_showPlots) drawAllCharts();
 
   const selQ   = (s.motors || [])[_selectedJoint];
   const ctrlQ  = (_ctrlMotors[_selectedJoint] || {});
@@ -1117,7 +1079,7 @@ function setGauge(id, val, decimals) {
 }
 
 // ============================================================
-// Signal-history charts
+// Signal-history charts (all 12 motors)
 // ============================================================
 function _autoRange(data, minSpan) {
   if (!data.length) return [-1, 1];
@@ -1128,68 +1090,58 @@ function _autoRange(data, minSpan) {
   return [lo - pad, hi + pad];
 }
 
-function drawOneChart(id, series, yMin, yMax, gridVals) {
-  const canvas = document.getElementById(id);
+function drawCanvas(canvas, series, yMin, yMax, color) {
   if (!canvas) return;
-  const W = canvas.clientWidth  || 400;
-  const H = canvas.clientHeight || 110;
+  const W = canvas.clientWidth  || 200;
+  const H = canvas.clientHeight || 40;
   if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#0f1117';
   ctx.fillRect(0, 0, W, H);
-  const PAD_L = 42, PAD_R = 6, PAD_T = 6, PAD_B = 6;
-  const PW = W - PAD_L - PAD_R;
-  const PH = H - PAD_T - PAD_B;
+  const PAD_L = 4, PAD_R = 44, PAD_T = 3, PAD_B = 3;
+  const PW = W - PAD_L - PAD_R, PH = H - PAD_T - PAD_B;
   const range = yMax - yMin || 1;
-  function toX(i, total) { return PAD_L + (total <= 1 ? PW/2 : i / (total - 1) * PW); }
-  function toY(v)         { return PAD_T + PH * (1 - (v - yMin) / range); }
-  // Grid lines
-  if (gridVals) {
+  function toY(v) { return PAD_T + PH * (1 - (v - yMin) / range); }
+  // Zero line
+  if (yMin <= 0 && yMax >= 0) {
+    const zy = toY(0);
     ctx.strokeStyle = '#21252f'; ctx.lineWidth = 1;
-    ctx.fillStyle   = '#5a6070'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
-    for (let g of gridVals) {
-      const gy = Math.round(toY(g)) + 0.5;
-      ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(W - PAD_R, gy); ctx.stroke();
-      ctx.fillText(g.toFixed(2), PAD_L - 3, gy + 3);
-    }
+    ctx.beginPath(); ctx.moveTo(PAD_L, zy); ctx.lineTo(W - PAD_R, zy); ctx.stroke();
   }
-  // Data series
-  const COLORS = ['#4f8ef7', '#3ecf6e'];
-  for (let s = 0; s < series.length; s++) {
-    const data = series[s];
-    if (!data.length) continue;
-    ctx.strokeStyle = COLORS[s % COLORS.length]; ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (let i = 0; i < data.length; i++) {
-      const x = toX(i, data.length), y = toY(data[i]);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+  // Y-axis labels (min / max) on the right
+  ctx.font = '8px monospace'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#5a6070';
+  ctx.fillText(yMax.toFixed(1), W - PAD_R + 3, PAD_T + 6);
+  ctx.fillText(yMin.toFixed(1), W - PAD_R + 3, H - PAD_B);
+  // Data line
+  if (!series.length) return;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = PAD_L + (series.length <= 1 ? PW / 2 : i / (series.length - 1) * PW);
+    const y = toY(series[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
+  ctx.stroke();
+  // Current value label (latest point)
+  const cur = series[series.length - 1];
+  const cy  = toY(cur);
+  ctx.fillStyle = color; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(cur.toFixed(2), W - PAD_R + 3, Math.max(PAD_T + 16, Math.min(H - PAD_B - 8, cy + 3)));
 }
 
 function drawAllCharts() {
-  const limits = JOINT_LIMITS[_selectedJoint];
-  const qGrids = [
-    parseFloat(limits[0].toFixed(2)), 0,
-    parseFloat(limits[1].toFixed(2))
-  ].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
-  drawOneChart('chart-q',
-    [_histQActual, _histQTarget],
-    limits[0], limits[1], qGrids);
-
-  const dqR   = _autoRange(_histDq, 0.5);
-  const dqGrid = [parseFloat(dqR[0].toFixed(2)), 0, parseFloat(dqR[1].toFixed(2))]
-    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
-  drawOneChart('chart-dq',  [_histDq],  dqR[0],  dqR[1],  dqGrid);
-
-  const tauR  = _autoRange(_histTau, 1.0);
-  const tauGrid = [parseFloat(tauR[0].toFixed(2)), 0, parseFloat(tauR[1].toFixed(2))]
-    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
-  drawOneChart('chart-tau', [_histTau], tauR[0], tauR[1], tauGrid);
+  for (let i = 0; i < 12; i++) {
+    const qR   = _autoRange(_histQ[i],   0.05);
+    drawCanvas(document.getElementById('mc-chart-q-'   + i), _histQ[i],   qR[0],  qR[1],  LEG_COLORS[i]);
+    const dqR  = _autoRange(_histDq[i],  0.5);
+    drawCanvas(document.getElementById('mc-chart-dq-'  + i), _histDq[i],  dqR[0], dqR[1], '#a78bfa');
+    const tauR = _autoRange(_histTau[i], 1.0);
+    drawCanvas(document.getElementById('mc-chart-tau-' + i), _histTau[i], tauR[0], tauR[1], '#f0c050');
+  }
 }
 
-window.addEventListener('resize', drawAllCharts);
+window.addEventListener('resize', function() { if (_showPlots) drawAllCharts(); });
 
 // ============================================================
 // Fetch helper

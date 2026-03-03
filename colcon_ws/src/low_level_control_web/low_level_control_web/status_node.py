@@ -90,12 +90,6 @@ class ControlNode(Node):
              'kp': 60.0, 'kd': 5.0}
             for _ in range(12)
         ]
-        # Interpolation state: ramp from q_interp toward q_target over interp_total steps.
-        # This mirrors the example's smooth percent ramp and avoids jerky jumps.
-        self._interp: list[dict] = [
-            {'q_from': 0.0, 'q_target': 0.0, 'step': 0, 'total': 1}
-            for _ in range(12)
-        ]
         self._estop: bool = False
         # Only publish /lowcmd once the user has explicitly enabled at least one motor.
         # This prevents fighting the sport controller on startup.
@@ -107,7 +101,7 @@ class ControlNode(Node):
 
         # Configurable control frequency
         self._ctrl_freq: float = 50.0
-        # Per-motor current commanded position (after interpolation) for display
+        # Per-motor current commanded position for display
         self._q_des: list = [0.0] * 12
 
         # ROS subscriptions / publications
@@ -133,56 +127,39 @@ class ControlNode(Node):
             self._latest_status = payload
 
     def _publish_cmd(self) -> None:
-        """50 Hz timer: build and publish a LowCmd reflecting current control state."""
+        """Build and publish a LowCmd reflecting current control state."""
         with self._lock:
             if not self._publishing_active:
                 return
-            # Take a snapshot of mutable interpolation state inside the lock.
-            interp = [dict(s) for s in self._interp]
+            estop = self._estop
+            cmds  = [dict(c) for c in self._motor_cmds]
+
         cmd = LowCmd()
         cmd.head = [0xFE, 0xEF]
         cmd.level_flag = 0xFF
         cmd.gpio = 0
 
-        with self._lock:
-            estop = self._estop
-            cmds  = [dict(c) for c in self._motor_cmds]
-            # Write incremented step back so progress is preserved across calls.
-            # (interp snapshot was taken above; we'll write steps back after loop.)
-
-        q_des_snap = [round(cmds[i]['q'], 4) if i < 12 else None for i in range(20)]
         for i in range(20):
             mc = MotorCmd()
-            # The example always uses mode=0x01 (PMSM servo mode) for all 20 motors.
-            # Switching mode mid-run causes glitches; keep it constant.
             mc.mode = 0x01
             if i < 12 and not estop and cmds[i]['enabled']:
-                # Active control: step the q interpolation toward the target.
                 c      = cmds[i]
-                inp    = interp[i]
-                inp['step'] = min(inp['step'] + 1, inp['total'])
-                pct    = inp['step'] / inp['total']
-                q_cmd  = (1.0 - pct) * inp['q_from'] + pct * inp['q_target']
-                q_des_snap[i] = round(q_cmd, 4)
                 kp_val = float(c['kp'])
                 kd_val = float(c['kd'])
                 # Sentinel: tell firmware to ignore position/velocity when
                 # the corresponding gain is zero (prevents residual damping).
-                mc.q   = POS_STOP_F if kp_val < 0.01 else float(q_cmd)
+                mc.q   = POS_STOP_F if kp_val < 0.01 else float(c['q'])
                 mc.dq  = VEL_STOP_F if kd_val < 0.01 else float(c['dq'])
                 mc.tau = float(c['tau'])
                 mc.kp  = kp_val
                 mc.kd  = kd_val
             elif i < 12 and estop:
-                # E-stop: light damping, no position term
                 mc.q   = POS_STOP_F
                 mc.dq  = VEL_STOP_F
                 mc.tau = 0.0
                 mc.kp  = 0.0
                 mc.kd  = 2.0
             else:
-                # Disabled / spare (i >= 12): PosStopF + VelStopF with kp=kd=0
-                # exactly as the example initialises idle motors.
                 mc.q   = POS_STOP_F
                 mc.dq  = VEL_STOP_F
                 mc.tau = 0.0
@@ -190,11 +167,9 @@ class ControlNode(Node):
                 mc.kd  = 0.0
             cmd.motor_cmd[i] = mc
 
-        # Write interpolation step progress and commanded q_des back under the lock.
         with self._lock:
             for i in range(12):
-                self._interp[i]['step'] = interp[i]['step']
-                self._q_des[i] = q_des_snap[i]
+                self._q_des[i] = round(cmds[i]['q'], 4) if cmds[i]['enabled'] else 0.0
 
         cmd.crc = _compute_crc(cmd)
         self._cmd_pub.publish(cmd)
@@ -232,18 +207,11 @@ class ControlNode(Node):
                       kp: float, kd: float, enabled: bool) -> None:
         """Update the control target for motor *idx* (0-11).
 
-        When enabled, the q command is smoothly interpolated from the current
-        actual joint position (from /lowstate) to *q* over INTERP_STEPS 50 Hz
-        ticks (~1 second), mirroring the example's ramp logic.
+        The q command takes effect immediately on the next control tick.
         """
         if not (0 <= idx <= 11):
             raise ValueError(f'Motor index {idx} out of range 0-11')
         with self._lock:
-            # Seed interpolation from the latest sensor reading so the ramp
-            # always starts at the actual joint angle, never from zero.
-            q_current = 0.0
-            if self._latest_status is not None:
-                q_current = float(self._latest_status['motors'][idx]['q'])
             self._motor_cmds[idx] = {
                 'enabled': bool(enabled),
                 'q':   float(q),
@@ -252,14 +220,6 @@ class ControlNode(Node):
                 'kp':  float(kp),
                 'kd':  float(kd),
             }
-            if enabled:
-                steps = max(1, int(0.1 * self._ctrl_freq))
-                self._interp[idx] = {
-                    'q_from':   q_current,
-                    'q_target': float(q),
-                    'step':     0,
-                    'total':    steps,
-                }
             # Start publishing as soon as any motor is enabled.
             if enabled:
                 self._publishing_active = True

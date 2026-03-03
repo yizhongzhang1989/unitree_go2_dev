@@ -128,6 +128,15 @@
       min-width: 60px; text-align: right;
       font-size: 15px; font-weight: 600; color: var(--accent);
     }
+    .slider-val-input {
+      width: 70px; text-align: right;
+      font-size: 14px; font-weight: 600;
+      background: var(--bg); color: inherit;
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 1px 4px; outline: none;
+      font-family: inherit;
+    }
+    .slider-val-input:focus { border-color: var(--accent); }
 
     /* Service table */
     .svc-table { width: 100%; border-collapse: collapse; }
@@ -391,12 +400,16 @@
         <div class="slider-row">
           <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
             <span style="font-size:12px;font-weight:700;color:var(--accent)">q &mdash; Position (rad)</span>
-            <span style="font-size:11px;color:var(--muted)" id="q-range-lbl">—</span>
+            <span style="display:flex;align-items:baseline;gap:8px">
+              <button onclick="setCurrentQ()" style="font-size:10px;padding:1px 6px;border:1px solid var(--accent);background:transparent;color:var(--accent);border-radius:3px;cursor:pointer;font-family:inherit" title="Set slider to actual joint position">Set Current</button>
+              <span style="font-size:11px;color:var(--muted)" id="q-range-lbl">—</span>
+            </span>
           </div>
           <div class="slider-value-row">
             <input type="range" id="q-slider" min="-3.14" max="3.14" step="0.01"
                    value="0" oninput="onQSlider(this.value)"/>
-            <span class="slider-val" id="q-slider-val">0.00</span>
+            <input class="slider-val-input" id="q-slider-val" value="0.00"
+                   onchange="onSliderInput('q', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -409,7 +422,8 @@
           <div class="slider-value-row">
             <input type="range" id="dq-slider" min="-20" max="20" step="0.1"
                    value="0" oninput="onDqSlider(this.value)"/>
-            <span class="slider-val" id="dq-slider-val" style="color:#a78bfa">0.0</span>
+            <input class="slider-val-input" id="dq-slider-val" style="color:#a78bfa" value="0.0"
+                   onchange="onSliderInput('dq', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -422,7 +436,8 @@
           <div class="slider-value-row">
             <input type="range" id="kp-slider" min="0" max="100" step="0.5"
                    value="60" oninput="onKpSlider(this.value)"/>
-            <span class="slider-val" id="kp-slider-val" style="color:var(--text)">60.0</span>
+            <input class="slider-val-input" id="kp-slider-val" style="color:var(--text)" value="60.0"
+                   onchange="onSliderInput('kp', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -435,7 +450,8 @@
           <div class="slider-value-row">
             <input type="range" id="kd-slider" min="0" max="10" step="0.05"
                    value="5" oninput="onKdSlider(this.value)"/>
-            <span class="slider-val" id="kd-slider-val" style="color:var(--muted)">5.00</span>
+            <input class="slider-val-input" id="kd-slider-val" style="color:var(--muted)" value="5.00"
+                   onchange="onSliderInput('kd', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -448,7 +464,8 @@
           <div class="slider-value-row">
             <input type="range" id="tau-slider" min="-23" max="23" step="0.1"
                    value="0" oninput="onTauSlider(this.value)"/>
-            <span class="slider-val" id="tau-slider-val" style="color:var(--yellow)">0.0</span>
+            <input class="slider-val-input" id="tau-slider-val" style="color:var(--yellow)" value="0.0"
+                   onchange="onSliderInput('tau', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -601,6 +618,7 @@ let _selectedJoint = 0;
 let _enabled       = false;
 let _estop         = false;
 let _ctrlMotors    = [];
+let _actualMotors  = [];
 let _showExtended  = false;
 let _showSystem    = false;
 let _showPlots     = false;
@@ -672,17 +690,25 @@ function togglePlots() {
 // ============================================================
 // Joint selection
 // ============================================================
+const ALL_JOINTS_Q_MIN = Math.min.apply(null, JOINT_LIMITS.map(function(l) { return l[0]; }));
+const ALL_JOINTS_Q_MAX = Math.max.apply(null, JOINT_LIMITS.map(function(l) { return l[1]; }));
+
 function selectJoint(idx) {
   _selectedJoint = idx;
   document.getElementById('joint-select').value = idx;
   updateSliderLimits(idx);
-  syncSlidersFromCtrl(idx);
+  if (idx >= 0) syncSlidersFromCtrl(idx);
   updateCardBorders();
 }
 
 function updateSliderLimits(idx) {
-  const limits = JOINT_LIMITS[idx];
-  const lo = limits[0], hi = limits[1];
+  var lo, hi;
+  if (idx === -1) {
+    lo = ALL_JOINTS_Q_MIN; hi = ALL_JOINTS_Q_MAX;
+  } else {
+    const limits = JOINT_LIMITS[idx];
+    lo = limits[0]; hi = limits[1];
+  }
   const sl = document.getElementById('q-slider');
   sl.min = lo; sl.max = hi; sl.step = 0.01;
   document.getElementById('q-range-lbl').textContent =
@@ -690,31 +716,31 @@ function updateSliderLimits(idx) {
   let v = parseFloat(sl.value);
   v = Math.max(lo, Math.min(hi, v));
   sl.value = v;
-  document.getElementById('q-slider-val').textContent = v.toFixed(2);
+  document.getElementById('q-slider-val').value = v.toFixed(2);
 }
 
 function syncSlidersFromCtrl(idx) {
-  if (!_ctrlMotors[idx]) return;
+  if (idx < 0 || !_ctrlMotors[idx]) return;
   const c = _ctrlMotors[idx];
-  if (document.activeElement.id !== 'q-slider') {
+  if (document.activeElement.id !== 'q-slider' && document.activeElement.id !== 'q-slider-val') {
     document.getElementById('q-slider').value = c.q != null ? c.q : 0;
-    document.getElementById('q-slider-val').textContent = parseFloat(c.q != null ? c.q : 0).toFixed(2);
+    document.getElementById('q-slider-val').value = parseFloat(c.q != null ? c.q : 0).toFixed(2);
   }
-  if (document.activeElement.id !== 'dq-slider') {
+  if (document.activeElement.id !== 'dq-slider' && document.activeElement.id !== 'dq-slider-val') {
     document.getElementById('dq-slider').value = c.dq != null ? c.dq : 0;
-    document.getElementById('dq-slider-val').textContent = parseFloat(c.dq != null ? c.dq : 0).toFixed(1);
+    document.getElementById('dq-slider-val').value = parseFloat(c.dq != null ? c.dq : 0).toFixed(1);
   }
-  if (document.activeElement.id !== 'kp-slider') {
+  if (document.activeElement.id !== 'kp-slider' && document.activeElement.id !== 'kp-slider-val') {
     document.getElementById('kp-slider').value = c.kp != null ? c.kp : 60;
-    document.getElementById('kp-slider-val').textContent = parseFloat(c.kp != null ? c.kp : 60).toFixed(1);
+    document.getElementById('kp-slider-val').value = parseFloat(c.kp != null ? c.kp : 60).toFixed(1);
   }
-  if (document.activeElement.id !== 'kd-slider') {
+  if (document.activeElement.id !== 'kd-slider' && document.activeElement.id !== 'kd-slider-val') {
     document.getElementById('kd-slider').value = c.kd != null ? c.kd : 5;
-    document.getElementById('kd-slider-val').textContent = parseFloat(c.kd != null ? c.kd : 5).toFixed(2);
+    document.getElementById('kd-slider-val').value = parseFloat(c.kd != null ? c.kd : 5).toFixed(2);
   }
-  if (document.activeElement.id !== 'tau-slider') {
+  if (document.activeElement.id !== 'tau-slider' && document.activeElement.id !== 'tau-slider-val') {
     document.getElementById('tau-slider').value = c.tau != null ? c.tau : 0;
-    document.getElementById('tau-slider-val').textContent = parseFloat(c.tau != null ? c.tau : 0).toFixed(1);
+    document.getElementById('tau-slider-val').value = parseFloat(c.tau != null ? c.tau : 0).toFixed(1);
   }
 }
 
@@ -723,10 +749,12 @@ function updateCardBorders() {
     const card = document.getElementById('mc-' + i);
     if (!card) continue;
     const en = _ctrlMotors[i] && _ctrlMotors[i].enabled;
-    if (_estop)                    card.className = 'motor-card estopped';
-    else if (i === _selectedJoint) card.className = 'motor-card selected' + (en ? ' enabled' : '');
-    else if (en)                   card.className = 'motor-card enabled';
-    else                           card.className = 'motor-card';
+    const sel = (_selectedJoint === -1 || i === _selectedJoint);
+    if (_estop)        card.className = 'motor-card estopped';
+    else if (sel && en) card.className = 'motor-card selected enabled';
+    else if (sel)       card.className = 'motor-card selected';
+    else if (en)        card.className = 'motor-card enabled';
+    else                card.className = 'motor-card';
   }
 }
 
@@ -754,10 +782,15 @@ function onStatus(s) {
   const ctrl = s.control || {};
   _estop = ctrl.estop || false;
   _ctrlMotors = ctrl.motors || _ctrlMotors;
-  _enabled = (_ctrlMotors[_selectedJoint] || {}).enabled || false;
+  if (_selectedJoint === -1) {
+    _enabled = _ctrlMotors.some(function(m) { return m && m.enabled; });
+  } else {
+    _enabled = (_ctrlMotors[_selectedJoint] || {}).enabled || false;
+  }
 
   // Motor cards
   const motors = s.motors || [];
+  _actualMotors = motors;
   for (let i = 0; i < motors.length; i++) {
     const m = motors[i];
     const tc = m.temperature >= 70 ? 'hot' : m.temperature >= 50 ? 'warm' : 'normal';
@@ -778,12 +811,19 @@ function onStatus(s) {
   updateCardBorders();
 
   // Sync sliders for selected joint
-  syncSlidersFromCtrl(_selectedJoint);
+  if (_selectedJoint >= 0) syncSlidersFromCtrl(_selectedJoint);
+  // In all-joints mode, don't auto-sync (values may differ per joint)
 
   // Enable button
   const ebtn = document.getElementById('enable-btn');
-  ebtn.textContent = _enabled ? 'Disable Motor' : 'Enable Motor';
-  ebtn.className   = _enabled ? 'on' : 'off';
+  if (_selectedJoint === -1) {
+    const anyOn = _ctrlMotors.some(function(m) { return m && m.enabled; });
+    ebtn.textContent = anyOn ? 'Disable All Motors' : 'Enable All Motors';
+    ebtn.className   = anyOn ? 'on' : 'off';
+  } else {
+    ebtn.textContent = _enabled ? 'Disable Motor' : 'Enable Motor';
+    ebtn.className   = _enabled ? 'on' : 'off';
+  }
 
   // E-stop buttons
   document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
@@ -1004,36 +1044,110 @@ function toggleService(name) {
 // Slider handlers
 // ============================================================
 function onQSlider(val) {
-  document.getElementById('q-slider-val').textContent = parseFloat(val).toFixed(2);
+  document.getElementById('q-slider-val').value = parseFloat(val).toFixed(2);
   if (_enabled) sendCmd({ q: parseFloat(val) });
 }
 function onDqSlider(val) {
-  document.getElementById('dq-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('dq-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ dq: parseFloat(val) });
 }
 function onKpSlider(val) {
-  document.getElementById('kp-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('kp-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ kp: parseFloat(val) });
 }
 function onKdSlider(val) {
-  document.getElementById('kd-slider-val').textContent = parseFloat(val).toFixed(2);
+  document.getElementById('kd-slider-val').value = parseFloat(val).toFixed(2);
   if (_enabled) sendCmd({ kd: parseFloat(val) });
 }
 function onTauSlider(val) {
-  document.getElementById('tau-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('tau-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ tau: parseFloat(val) });
 }
 
+// Set q slider to current actual position
+function setCurrentQ() {
+  if (_selectedJoint === -1) {
+    // All-joints mode: set each joint's q to its own current position
+    for (let i = 0; i < 12; i++) {
+      const m = _actualMotors[i];
+      if (m && m.q != null) {
+        const c = _ctrlMotors[i] || {};
+        post('/api/cmd', {
+          motor_idx: i,
+          enabled:   c.enabled || false,
+          q:   m.q,
+          dq:  c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value),
+          kp:  c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value),
+          kd:  c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value),
+          tau: c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value),
+        });
+      }
+    }
+  } else {
+    const m = _actualMotors[_selectedJoint];
+    if (m && m.q != null) {
+      const sl = document.getElementById('q-slider');
+      const v = Math.max(parseFloat(sl.min), Math.min(parseFloat(sl.max), m.q));
+      sl.value = v;
+      document.getElementById('q-slider-val').value = v.toFixed(2);
+      const c = _ctrlMotors[_selectedJoint] || {};
+      post('/api/cmd', {
+        motor_idx: _selectedJoint,
+        enabled:   c.enabled || false,
+        q:   v,
+        dq:  c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value),
+        kp:  c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value),
+        kd:  c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value),
+        tau: c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value),
+      });
+    }
+  }
+}
+
+// Direct-input handler: user typed a value in the editable field
+function onSliderInput(param, raw) {
+  var v = parseFloat(raw);
+  if (isNaN(v)) return;
+  var slider = document.getElementById(param + '-slider');
+  v = Math.max(parseFloat(slider.min), Math.min(parseFloat(slider.max), v));
+  slider.value = v;
+  // Format the display based on param
+  var fmt = (param === 'q') ? v.toFixed(2) :
+            (param === 'kd') ? v.toFixed(2) :
+            v.toFixed(1);
+  document.getElementById(param + '-slider-val').value = fmt;
+  if (_enabled) {
+    var obj = {}; obj[param] = v;
+    sendCmd(obj);
+  }
+}
+
 function sendCmd(overrides) {
-  post('/api/cmd', {
-    motor_idx: _selectedJoint,
-    enabled:   true,
-    q:   overrides.q   != null ? overrides.q   : parseFloat(document.getElementById('q-slider').value),
-    dq:  overrides.dq  != null ? overrides.dq  : parseFloat(document.getElementById('dq-slider').value),
-    kp:  overrides.kp  != null ? overrides.kp  : parseFloat(document.getElementById('kp-slider').value),
-    kd:  overrides.kd  != null ? overrides.kd  : parseFloat(document.getElementById('kd-slider').value),
-    tau: overrides.tau != null ? overrides.tau : parseFloat(document.getElementById('tau-slider').value),
-  });
+  if (_selectedJoint === -1) {
+    // All-joints mode: send override to every joint, keeping each joint's own values for untouched params
+    for (let i = 0; i < 12; i++) {
+      const c = _ctrlMotors[i] || {};
+      post('/api/cmd', {
+        motor_idx: i,
+        enabled:   true,
+        q:   overrides.q   != null ? overrides.q   : (c.q   != null ? c.q   : parseFloat(document.getElementById('q-slider').value)),
+        dq:  overrides.dq  != null ? overrides.dq  : (c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value)),
+        kp:  overrides.kp  != null ? overrides.kp  : (c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value)),
+        kd:  overrides.kd  != null ? overrides.kd  : (c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value)),
+        tau: overrides.tau != null ? overrides.tau : (c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value)),
+      });
+    }
+  } else {
+    post('/api/cmd', {
+      motor_idx: _selectedJoint,
+      enabled:   true,
+      q:   overrides.q   != null ? overrides.q   : parseFloat(document.getElementById('q-slider').value),
+      dq:  overrides.dq  != null ? overrides.dq  : parseFloat(document.getElementById('dq-slider').value),
+      kp:  overrides.kp  != null ? overrides.kp  : parseFloat(document.getElementById('kp-slider').value),
+      kd:  overrides.kd  != null ? overrides.kd  : parseFloat(document.getElementById('kd-slider').value),
+      tau: overrides.tau != null ? overrides.tau : parseFloat(document.getElementById('tau-slider').value),
+    });
+  }
 }
 
 // ============================================================
@@ -1041,7 +1155,17 @@ function sendCmd(overrides) {
 // ============================================================
 function toggleEnable() {
   if (_estop) return;
-  if (_enabled) {
+  if (_selectedJoint === -1) {
+    // All-joints mode
+    const anyOn = _ctrlMotors.some(function(m) { return m && m.enabled; });
+    if (anyOn) {
+      for (let i = 0; i < 12; i++) {
+        post('/api/cmd', { motor_idx: i, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
+      }
+    } else {
+      sendCmd({});
+    }
+  } else if (_enabled) {
     post('/api/cmd', { motor_idx: _selectedJoint, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
   } else {
     sendCmd({});
@@ -1159,12 +1283,18 @@ function post(url, body) {
 // ============================================================
 (function init() {
   const sel = document.getElementById('joint-select');
+  // "All Joints" option
+  const allOpt = document.createElement('option');
+  allOpt.value = -1;
+  allOpt.textContent = 'All Joints';
+  sel.appendChild(allOpt);
   for (let i = 0; i < 12; i++) {
     const o = document.createElement('option');
     o.value = i;
     o.textContent = i + ': ' + MOTOR_NAMES[i];
     sel.appendChild(o);
   }
+  sel.value = 0;
   buildMotorCards();
   updateSliderLimits(0);
   buildBmsCells(15);

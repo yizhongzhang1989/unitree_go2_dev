@@ -1,8 +1,6 @@
 from setuptools import find_packages, setup
-import os
-from glob import glob
 
-package_name = 'low_level_status_web'
+package_name = 'service_web'
 
 setup(
     name=package_name,
@@ -11,22 +9,17 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        ('share/' + package_name + '/launch', ['launch/service_web.launch.py']),
     ],
-    install_requires=[
-        'setuptools',
-        'fastapi',
-        'uvicorn[standard]',
-    ],
+    install_requires=['setuptools'],
     zip_safe=True,
     maintainer='developer',
     maintainer_email='dev@example.com',
-    description='Unitree Go2 real-time low-level motor status web monitor',
+    description='Unitree Go2 service manager web dashboard',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'low_level_status_web = low_level_status_web.main:main',
+            'service_web = service_web.main:main',
         ],
     },
 )

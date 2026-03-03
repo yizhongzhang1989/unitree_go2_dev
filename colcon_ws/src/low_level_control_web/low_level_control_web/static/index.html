@@ -1163,7 +1163,20 @@ function toggleEnable() {
         post('/api/cmd', { motor_idx: i, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
       }
     } else {
-      sendCmd({});
+      // Enable all joints — set each joint's q to its current actual position
+      for (let i = 0; i < 12; i++) {
+        const m = _actualMotors[i] || {};
+        const q = (m.q != null) ? m.q : 0;
+        post('/api/cmd', {
+          motor_idx: i,
+          enabled:   true,
+          q:   q,
+          dq:  parseFloat(document.getElementById('dq-slider').value),
+          kp:  parseFloat(document.getElementById('kp-slider').value),
+          kd:  parseFloat(document.getElementById('kd-slider').value),
+          tau: parseFloat(document.getElementById('tau-slider').value),
+        });
+      }
     }
   } else if (_enabled) {
     post('/api/cmd', { motor_idx: _selectedJoint, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });

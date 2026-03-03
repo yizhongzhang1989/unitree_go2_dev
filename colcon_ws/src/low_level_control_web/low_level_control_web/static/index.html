@@ -185,6 +185,13 @@
       background: #2e3147; color: var(--text);
     }
 
+    #drag-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+    }
+    #drag-btn.on  { background: #f59e0b; color: #000; }
+    #drag-btn.off { background: #2e3147; color: var(--text); }
+
     /* Right column — motor card grid */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
     .motor-grid {
@@ -492,6 +499,19 @@
       <div class="card-title">Control Output</div>
       <div class="btn-row" style="flex-direction:column;gap:10px;">
         <button id="enable-btn" class="off" onclick="toggleEnable()">Enable Motor</button>
+        <button id="drag-btn" class="off" onclick="toggleDrag()">Drag Mode: OFF</button>
+        <div id="drag-limit-row" style="display:none;margin-top:2px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:#f59e0b">Torque Limit (Nm)</span>
+            <span style="font-size:11px;color:var(--muted)" id="drag-limit-range">0.1 &hellip; 40</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="drag-limit-slider" min="0.1" max="40" step="0.1"
+                   value="5" oninput="onDragTauLimit(this.value)"/>
+            <input class="slider-val-input" id="drag-limit-val" style="color:#f59e0b" value="5.0"
+                   onchange="onSliderInput('drag-limit', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
+          </div>
+        </div>
         <button id="estop-btn" onclick="triggerEstop()">&#9940; EMERGENCY STOP</button>
         <button id="clear-estop-btn" onclick="clearEstop()" style="display:none">Clear E-stop</button>
       </div>
@@ -622,6 +642,7 @@ let _actualMotors  = [];
 let _showExtended  = false;
 let _showSystem    = false;
 let _showPlots     = false;
+let _dragMode      = false;
 // Per-motor signal history (12 motors × 4 signals)
 let _histQ   = Array.from({length:12}, () => []);
 let _histDq  = Array.from({length:12}, () => []);
@@ -825,6 +846,29 @@ function onStatus(s) {
     ebtn.className   = _enabled ? 'on' : 'off';
   }
 
+  // Drag mode button
+  const dbtn = document.getElementById('drag-btn');
+  const dlRow = document.getElementById('drag-limit-row');
+  if (_selectedJoint === -1) {
+    const anyDrag = _ctrlMotors.some(function(m) { return m && m.drag; });
+    _dragMode = anyDrag;
+    dbtn.textContent = anyDrag ? 'Drag Mode: ON' : 'Drag Mode: OFF';
+    dbtn.className   = anyDrag ? 'on' : 'off';
+    dlRow.style.display = anyDrag ? '' : 'none';
+  } else {
+    const dm = (_ctrlMotors[_selectedJoint] || {}).drag || false;
+    _dragMode = dm;
+    dbtn.textContent = dm ? 'Drag Mode: ON' : 'Drag Mode: OFF';
+    dbtn.className   = dm ? 'on' : 'off';
+    dlRow.style.display = dm ? '' : 'none';
+    // Sync tau_limit slider
+    const dtl = (_ctrlMotors[_selectedJoint] || {}).drag_tau_limit;
+    if (dtl != null && document.activeElement.id !== 'drag-limit-slider' && document.activeElement.id !== 'drag-limit-val') {
+      document.getElementById('drag-limit-slider').value = dtl;
+      document.getElementById('drag-limit-val').value = parseFloat(dtl).toFixed(1);
+    }
+  }
+
   // E-stop buttons
   document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
   document.getElementById('clear-estop-btn').style.display = _estop ? '' : 'none';
@@ -968,7 +1012,7 @@ function updatePower(d) {
 
 function updateBMS(bms) {
   setVal('bms-soc',  bms.soc     != null ? bms.soc + ' %'              : '—');
-  setVal('bms-cur',  bms.current != null ? bms.current.toFixed(2) + ' A' : '—');
+  setVal('bms-cur',  bms.current != null ? (bms.current / 1000).toFixed(2) + ' A' : '—');
   setVal('bms-cyc',  bms.cycle   != null ? bms.cycle   : '—');
   setVal('bms-sta',  bms.status  != null ? '0x' + bms.status.toString(16).toUpperCase() : '—');
   setVal('bms-ver',  bms.version != null ? bms.version : '—');
@@ -1116,6 +1160,11 @@ function onSliderInput(param, raw) {
             (param === 'kd') ? v.toFixed(2) :
             v.toFixed(1);
   document.getElementById(param + '-slider-val').value = fmt;
+  // Drag-limit goes to the drag API, not sendCmd
+  if (param === 'drag-limit') {
+    onDragTauLimit(v);
+    return;
+  }
   if (_enabled) {
     var obj = {}; obj[param] = v;
     sendCmd(obj);
@@ -1182,6 +1231,33 @@ function toggleEnable() {
     post('/api/cmd', { motor_idx: _selectedJoint, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
   } else {
     sendCmd({});
+  }
+}
+
+function toggleDrag() {
+  if (_selectedJoint === -1) {
+    // All-joints mode: toggle drag for all 12
+    var newState = !_dragMode;
+    var lim = parseFloat(document.getElementById('drag-limit-slider').value);
+    for (let i = 0; i < 12; i++) {
+      post('/api/drag', { motor_idx: i, enabled: newState, tau_limit: lim });
+    }
+  } else {
+    var cur = (_ctrlMotors[_selectedJoint] || {}).drag || false;
+    var lim = parseFloat(document.getElementById('drag-limit-slider').value);
+    post('/api/drag', { motor_idx: _selectedJoint, enabled: !cur, tau_limit: lim });
+  }
+}
+
+function onDragTauLimit(val) {
+  val = parseFloat(val);
+  document.getElementById('drag-limit-val').value = val.toFixed(1);
+  if (_selectedJoint === -1) {
+    for (let i = 0; i < 12; i++) {
+      post('/api/drag', { motor_idx: i, enabled: true, tau_limit: val });
+    }
+  } else {
+    post('/api/drag', { motor_idx: _selectedJoint, enabled: true, tau_limit: val });
   }
 }
 

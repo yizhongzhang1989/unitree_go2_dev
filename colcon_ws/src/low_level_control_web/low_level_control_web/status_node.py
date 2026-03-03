@@ -95,6 +95,19 @@ class ControlNode(Node):
         # This prevents fighting the sport controller on startup.
         self._publishing_active: bool = False
 
+        # Drag mode: torque-limited compliance.
+        # When drag is enabled for a motor, if |tau_est| > tau_limit the
+        # position target is updated to the actual position so the joint yields.
+        self._drag_enabled: list[bool] = [False] * 12
+        # Default torque limits per joint type (Nm).
+        # Go2 hip=~23.7 Nm, thigh/calf=~45.43 Nm peak; use conservative defaults.
+        self._drag_tau_limit: list[float] = [
+            5.0, 5.0, 5.0,   # FR hip, thigh, calf
+            5.0, 5.0, 5.0,   # FL
+            5.0, 5.0, 5.0,   # RR
+            5.0, 5.0, 5.0,   # RL
+        ]
+
         # Mode state: 'unknown' → 'releasing' → 'released' → 'restoring' → 'sport'
         self._mode_state: str = 'unknown'
         self._mode_original: str = ''
@@ -133,6 +146,21 @@ class ControlNode(Node):
                 return
             estop = self._estop
             cmds  = [dict(c) for c in self._motor_cmds]
+            drag_en = list(self._drag_enabled)
+            drag_lim = list(self._drag_tau_limit)
+            status = self._latest_status
+
+        # Drag mode: update position targets for joints where |tau_est| > limit
+        if status is not None:
+            motors_fb = status.get('motors', [])
+            for i in range(min(12, len(motors_fb))):
+                if cmds[i]['enabled'] and drag_en[i]:
+                    tau_est = motors_fb[i].get('tau_est')
+                    q_act   = motors_fb[i].get('q')
+                    if tau_est is not None and q_act is not None:
+                        if abs(tau_est) > drag_lim[i]:
+                            # Yield: move target to actual position
+                            cmds[i]['q'] = float(q_act)
 
         cmd = LowCmd()
         cmd.head = [0xFE, 0xEF]
@@ -170,6 +198,9 @@ class ControlNode(Node):
         with self._lock:
             for i in range(12):
                 self._q_des[i] = round(cmds[i]['q'], 4) if cmds[i]['enabled'] else 0.0
+                # Persist yielded position back so next tick starts from here
+                if cmds[i]['enabled'] and drag_en[i]:
+                    self._motor_cmds[i]['q'] = cmds[i]['q']
 
         cmd.crc = _compute_crc(cmd)
         self._cmd_pub.publish(cmd)
@@ -194,7 +225,9 @@ class ControlNode(Node):
                 'estop':  self._estop,
                 'freq':   self._ctrl_freq,
                 'motors': [
-                    {**dict(c), 'q_des': self._q_des[i]}
+                    {**dict(c), 'q_des': self._q_des[i],
+                     'drag': self._drag_enabled[i],
+                     'drag_tau_limit': self._drag_tau_limit[i]}
                     for i, c in enumerate(self._motor_cmds)
                 ],
             }
@@ -227,6 +260,19 @@ class ControlNode(Node):
                 any_enabled = any(c['enabled'] for c in self._motor_cmds)
                 if not any_enabled and not self._estop:
                     self._publishing_active = False
+
+    def set_drag(self, idx: int, enabled: bool, tau_limit: float | None = None) -> None:
+        """Enable/disable drag (torque-limited compliance) for motor *idx*.
+
+        When drag is active and |tau_est| exceeds *tau_limit*, the position
+        target is updated to the actual joint position so the joint yields.
+        """
+        if not (0 <= idx <= 11):
+            raise ValueError(f'Motor index {idx} out of range 0-11')
+        with self._lock:
+            self._drag_enabled[idx] = bool(enabled)
+            if tau_limit is not None:
+                self._drag_tau_limit[idx] = max(0.1, float(tau_limit))
 
     def set_estop(self, active: bool) -> None:
         """Activate or clear the emergency stop."""

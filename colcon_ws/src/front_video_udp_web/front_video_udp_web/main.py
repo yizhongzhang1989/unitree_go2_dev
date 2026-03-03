@@ -16,7 +16,7 @@ import logging
 import signal
 import sys
 
-from go2_common.config import load_config
+from common.config import load_config
 from front_video_udp_web.camera_capture import CameraCapture, _NATIVE_W, _NATIVE_H
 from front_video_udp_web.web_server import MJPEGServer, set_camera_capture
 

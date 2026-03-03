@@ -15,7 +15,7 @@ import threading
 import rclpy
 import uvicorn
 
-from go2_common.config import load_config
+from common.config import load_config
 from low_level_joint_control_web.control_node import JointControlNode
 from low_level_joint_control_web.web_server import app, set_node, _ServicePoller, set_service_poller
 

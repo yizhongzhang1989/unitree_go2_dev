@@ -1,10 +1,10 @@
-"""main.py — Entry point for go2_service_web.
+"""main.py — Entry point for service_web.
 
 Usage (direct):
-    go2_service_web [--host 0.0.0.0] [--port 8085] [--network-interface eth0]
+    service_web [--host 0.0.0.0] [--port 8085] [--network-interface eth0]
 
 Usage (via launch):
-    ros2 launch go2_service_web go2_service_web.launch.py
+    ros2 launch service_web service_web.launch.py
 """
 
 import argparse
@@ -13,9 +13,9 @@ import sys
 
 import uvicorn
 
-from go2_common.config import load_config
-from go2_service_web.service_manager import ServiceManager
-from go2_service_web.web_server import app, set_manager
+from common.config import load_config
+from service_web.service_manager import ServiceManager
+from service_web.web_server import app, set_manager
 
 
 def main(args=None) -> None:
@@ -46,14 +46,14 @@ def main(args=None) -> None:
     set_manager(mgr)
 
     def _shutdown(sig, frame):
-        print('\n[go2_service_web] Shutting down…')
+        print('\n[service_web] Shutting down…')
         mgr.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    print(f'[go2_service_web] Dashboard → http://{parsed.host}:{parsed.port}')
+    print(f'[service_web] Dashboard → http://{parsed.host}:{parsed.port}')
     uvicorn.run(app, host=parsed.host, port=parsed.port, log_level='warning')
 
 

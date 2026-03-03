@@ -20,7 +20,7 @@ import uvicorn
 
 from low_level_control_web.status_node import ControlNode
 from low_level_control_web.web_server import app, set_status_capture, _ServicePoller, set_service_poller
-from go2_common.config import load_config
+from common.config import load_config
 
 
 def main(args=None) -> None:

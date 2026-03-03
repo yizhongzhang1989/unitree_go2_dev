@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'go2_common'
+package_name = 'common'
 
 setup(
     name=package_name,

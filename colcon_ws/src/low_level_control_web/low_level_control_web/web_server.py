@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Set
 
-from go2_common.service_client import ServiceClient
+from common.service_client import ServiceClient
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse

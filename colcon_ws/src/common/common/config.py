@@ -16,7 +16,7 @@ Setup::
 
 Usage::
 
-    from go2_common.config import load_config
+    from common.config import load_config
     cfg = load_config()
     print(cfg.network_interface)   # 'eth0' or None
 """
@@ -134,7 +134,7 @@ def load_config() -> RobotConfig:
 
     This is the **primary entry point** for all packages::
 
-        from go2_common.config import load_config
+        from common.config import load_config
 
         cfg = load_config()
         print(cfg.network_interface)  # e.g. 'eth0' or None
@@ -158,7 +158,7 @@ def save_config(data: dict) -> None:
     cfg.parent.mkdir(parents=True, exist_ok=True)
     with cfg.open('w') as fh:
         fh.write('# Unitree Go2 robot configuration\n')
-        fh.write('# Edit this file or use go2_common.config.save_config()\n\n')
+        fh.write('# Edit this file or use common.config.save_config()\n\n')
         for key, val in existing.items():
             fh.write(f'{key}: {val}\n')
 

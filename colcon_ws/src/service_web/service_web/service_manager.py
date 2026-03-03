@@ -1,7 +1,7 @@
 """
 service_manager.py — Background service list poller and switch controller.
 
-Delegates entirely to go2_common.service_client.ServiceClient, which
+Delegates entirely to common.service_client.ServiceClient, which
 contains the shared subprocess logic and polling loop.
 
 The ``ServiceManager`` name is kept for backward compatibility with
@@ -14,6 +14,6 @@ API:
     mgr.shutdown()
 """
 
-from go2_common.service_client import ServiceClient as ServiceManager  # noqa: F401
+from common.service_client import ServiceClient as ServiceManager  # noqa: F401
 
 __all__ = ['ServiceManager']

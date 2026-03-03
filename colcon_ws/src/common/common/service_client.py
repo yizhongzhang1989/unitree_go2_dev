@@ -13,7 +13,7 @@ ServiceClient(network_interface=None, target_services=None)
 
     *target_services* — optional tuple of service names to keep in the
     cached state dict.  ``None`` means keep all services (used by
-    ``go2_service_web``).  The low-level control packages filter to the
+    ``service_web``).  The low-level control packages filter to the
     four services required for low-level access.
 """
 
@@ -121,7 +121,7 @@ class ServiceClient:
         self._targets  = set(target_services) if target_services else None
         self._lock     = threading.Lock()
         self._state: dict = {}      # {name: {'status': int, 'protect': bool}}
-        self._all_services: list = []  # raw list (used by go2_service_web)
+        self._all_services: list = []  # raw list (used by service_web)
         self._error: Optional[str] = None
         self._last_update: float = 0.0
         self._stop = threading.Event()
@@ -165,7 +165,7 @@ class ServiceClient:
                 'last_update': float,
             }
 
-        Used by ``go2_service_web`` (which iterates the full list).
+        Used by ``service_web`` (which iterates the full list).
         """
         with self._lock:
             return {

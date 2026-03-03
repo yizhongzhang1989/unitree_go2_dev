@@ -10,7 +10,7 @@ import signal
 
 import uvicorn
 
-from go2_common.config import load_config
+from common.config import load_config
 from go2_cam_web.camera_node import CameraCapture
 from go2_cam_web.web_server import app, set_camera_node
 

@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'go2_service_web'
+package_name = 'service_web'
 
 setup(
     name=package_name,
@@ -9,7 +9,7 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/go2_service_web.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/service_web.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -19,7 +19,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'go2_service_web = go2_service_web.main:main',
+            'service_web = service_web.main:main',
         ],
     },
 )

@@ -11,9 +11,9 @@ def generate_launch_description():
         DeclareLaunchArgument('network_interface', default_value=''),
 
         Node(
-            package='go2_service_web',
-            executable='go2_service_web',
-            name='go2_service_web',
+            package='service_web',
+            executable='service_web',
+            name='service_web',
             output='screen',
             arguments=[
                 '--host',              LaunchConfiguration('host'),

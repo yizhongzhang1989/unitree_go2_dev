@@ -105,12 +105,21 @@ class ControlNode(Node):
         self._mode_state: str = 'unknown'
         self._mode_original: str = ''
 
+        # Configurable control frequency
+        self._ctrl_freq: float = 50.0
+        # Per-motor current commanded position (after interpolation) for display
+        self._q_des: list = [0.0] * 12
+
         # ROS subscriptions / publications
         self.create_subscription(LowState, '/lowstate', self._state_cb, 10)
         self._cmd_pub = self.create_publisher(LowCmd, '/lowcmd', 10)
 
-        # Publish control commands at 50 Hz
-        self.create_timer(0.02, self._publish_cmd)
+        # Control loop runs in a background thread; frequency controlled by _ctrl_freq.
+        self._stop_event = threading.Event()
+        self._ctrl_thread = threading.Thread(
+            target=self._control_loop, daemon=True, name='ctrl_loop'
+        )
+        self._ctrl_thread.start()
 
         self.get_logger().info('Subscribed to /lowstate; /lowcmd publishing will start when a motor is enabled')
 
@@ -141,6 +150,7 @@ class ControlNode(Node):
             # Write incremented step back so progress is preserved across calls.
             # (interp snapshot was taken above; we'll write steps back after loop.)
 
+        q_des_snap = [round(cmds[i]['q'], 4) if i < 12 else None for i in range(20)]
         for i in range(20):
             mc = MotorCmd()
             # The example always uses mode=0x01 (PMSM servo mode) for all 20 motors.
@@ -153,6 +163,7 @@ class ControlNode(Node):
                 inp['step'] = min(inp['step'] + 1, inp['total'])
                 pct    = inp['step'] / inp['total']
                 q_cmd  = (1.0 - pct) * inp['q_from'] + pct * inp['q_target']
+                q_des_snap[i] = round(q_cmd, 4)
                 kp_val = float(c['kp'])
                 kd_val = float(c['kd'])
                 # Sentinel: tell firmware to ignore position/velocity when
@@ -179,10 +190,11 @@ class ControlNode(Node):
                 mc.kd  = 0.0
             cmd.motor_cmd[i] = mc
 
-        # Write interpolation step progress back under the lock.
+        # Write interpolation step progress and commanded q_des back under the lock.
         with self._lock:
             for i in range(12):
                 self._interp[i]['step'] = interp[i]['step']
+                self._q_des[i] = q_des_snap[i]
 
         cmd.crc = _compute_crc(cmd)
         self._cmd_pub.publish(cmd)
@@ -195,16 +207,26 @@ class ControlNode(Node):
         with self._lock:
             return self._latest_status
 
-    def get_control_state(self) -> list:
-        """Return a copy of all 12 motor control dicts plus estop flag."""
+    def set_freq(self, freq: float) -> None:
+        """Set the control loop publish frequency (1–500 Hz)."""
+        with self._lock:
+            self._ctrl_freq = max(1.0, min(500.0, float(freq)))
+
+    def get_control_state(self) -> dict:
+        """Return motor control state, estop flag, q_des per motor, and ctrl freq."""
         with self._lock:
             return {
                 'estop':  self._estop,
-                'motors': [dict(c) for c in self._motor_cmds],
+                'freq':   self._ctrl_freq,
+                'motors': [
+                    {**dict(c), 'q_des': self._q_des[i]}
+                    for i, c in enumerate(self._motor_cmds)
+                ],
             }
 
-    # Default interpolation duration at 50 Hz: 0.1 second = 5 steps.
-    INTERP_STEPS: int = 5
+    def shutdown(self) -> None:
+        """Stop the background control thread."""
+        self._stop_event.set()
 
     def set_motor_cmd(self, idx: int, q: float, dq: float, tau: float,
                       kp: float, kd: float, enabled: bool) -> None:
@@ -231,11 +253,12 @@ class ControlNode(Node):
                 'kd':  float(kd),
             }
             if enabled:
+                steps = max(1, int(0.1 * self._ctrl_freq))
                 self._interp[idx] = {
                     'q_from':   q_current,
                     'q_target': float(q),
                     'step':     0,
-                    'total':    self.INTERP_STEPS,
+                    'total':    steps,
                 }
             # Start publishing as soon as any motor is enabled.
             if enabled:
@@ -317,6 +340,26 @@ class ControlNode(Node):
             with self._lock:
                 self._mode_state = 'error'
             self.get_logger().error(f'Mode restore failed: {e}')
+
+    def _control_loop(self) -> None:
+        """Background thread: calls _publish_cmd at the configured frequency."""
+        import time as _time
+        last_freq = -1.0
+        next_deadline = _time.monotonic()
+        while not self._stop_event.is_set():
+            with self._lock:
+                freq = max(1.0, self._ctrl_freq)
+            dt = 1.0 / freq
+            if freq != last_freq:
+                next_deadline = _time.monotonic()
+                last_freq = freq
+            self._publish_cmd()
+            next_deadline += dt
+            sleep_for = next_deadline - _time.monotonic()
+            if sleep_for > 0:
+                _time.sleep(sleep_for)
+            else:
+                next_deadline = _time.monotonic()
 
     def get_mode_state(self) -> dict:
         with self._lock:

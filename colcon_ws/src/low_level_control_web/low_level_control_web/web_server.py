@@ -76,6 +76,10 @@ class MotorCmdRequest(BaseModel):
     kd:        float = 5.0
 
 
+class FreqRequest(BaseModel):
+    freq: float             # Hz, clamped to 1–500
+
+
 # ---------------------------------------------------------------------------
 # WebSocket manager
 # ---------------------------------------------------------------------------
@@ -167,6 +171,14 @@ async def api_cmd(req: MotorCmdRequest) -> JSONResponse:
         )
     except ValueError as e:
         return JSONResponse({'error': str(e)}, status_code=400)
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/freq', response_class=JSONResponse)
+async def api_freq(req: FreqRequest) -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    _status_capture.set_freq(req.freq)
     return JSONResponse({'ok': True})
 
 

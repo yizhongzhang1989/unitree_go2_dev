@@ -288,6 +288,35 @@
       font-size: 12px; color: var(--muted);
       display: flex; gap: 24px;
     }
+
+    /* ---- Live gauges for selected motor ---- */
+    .gauge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .gauge {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+    .gauge-label {
+      font-size: 9px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: .05em;
+      margin-bottom: 4px;
+    }
+    .gauge-value {
+      font-size: 18px; font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .gauge-unit { font-size: 10px; color: var(--muted); margin-left: 2px; }
+
+    /* ---- Signal-history charts ---- */
+    .chart-block { display: flex; flex-direction: column; gap: 0; }
+    .chart-row   { display: flex; flex-direction: column; gap: 4px; padding-bottom: 10px; }
+    .chart-row:last-child { padding-bottom: 0; }
+    .chart-label { font-size: 10px; font-weight: 600; letter-spacing: .06em;
+                   text-transform: uppercase; color: var(--muted); }
+    .chart-wrap  { height: 110px; position: relative; }
+    .chart-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 4px; }
   </style>
 </head>
 <body>
@@ -422,6 +451,21 @@
       </div>
     </div>
 
+    <!-- Control frequency -->
+    <div class="card">
+      <div class="card-title">Control Frequency</div>
+      <div class="slider-row">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:4px;">
+          <span>1 Hz</span><span>500 Hz</span>
+        </div>
+        <div class="slider-value-row">
+          <input type="range" id="freq-slider" min="1" max="500" step="1"
+                 value="50" oninput="onFreqSlider(this.value)"/>
+          <span class="slider-val" id="freq-val">50 Hz</span>
+        </div>
+      </div>
+    </div>
+
     <!-- Control output -->
     <div class="card">
       <div class="card-title">Control Output</div>
@@ -437,9 +481,66 @@
   <!-- ======== RIGHT: 12 motor cards ======== -->
   <div class="right-col">
     <div class="card" style="padding:14px 16px;">
-      <div class="card-title">All Motor States — click a card to select joint</div>
+      <div class="card-title">All Motor States &mdash; click a card to select joint</div>
       <div class="motor-grid" id="motor-grid"></div>
     </div>
+
+    <!-- Live gauges for the selected motor -->
+    <div class="card">
+      <div class="card-title" id="gauges-title">Live Gauges &mdash; Motor 0</div>
+      <div class="gauge-grid">
+        <div class="gauge">
+          <div class="gauge-label">q actual</div>
+          <div class="gauge-value" id="g-q-act">&#x2014;</div>
+          <div class="gauge-unit">rad</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">q target</div>
+          <div class="gauge-value" id="g-q-tgt">&#x2014;</div>
+          <div class="gauge-unit">rad</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">q error</div>
+          <div class="gauge-value" id="g-q-err">&#x2014;</div>
+          <div class="gauge-unit">rad</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">velocity</div>
+          <div class="gauge-value" id="g-dq">&#x2014;</div>
+          <div class="gauge-unit">rad/s</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">&tau; est</div>
+          <div class="gauge-value" id="g-tau">&#x2014;</div>
+          <div class="gauge-unit">N&middot;m</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">temp</div>
+          <div class="gauge-value" id="g-temp">&#x2014;</div>
+          <div class="gauge-unit">&deg;C</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Signal-history charts for the selected motor -->
+    <div class="card">
+      <div class="card-title" id="charts-title">Signal History &mdash; Motor 0</div>
+      <div class="chart-block">
+        <div class="chart-row">
+          <div class="chart-label">Position (rad)</div>
+          <div class="chart-wrap"><canvas id="chart-q"></canvas></div>
+        </div>
+        <div class="chart-row">
+          <div class="chart-label">Velocity (rad/s)</div>
+          <div class="chart-wrap"><canvas id="chart-dq"></canvas></div>
+        </div>
+        <div class="chart-row">
+          <div class="chart-label">Torque est (N&middot;m)</div>
+          <div class="chart-wrap"><canvas id="chart-tau"></canvas></div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
 </div>
@@ -525,6 +626,7 @@
 // ============================================================
 // Constants
 // ============================================================
+const CHART_HISTORY = 200;
 const MOTOR_NAMES = [
   'FR_0 hip','FR_1 thigh','FR_2 calf',
   'FL_0 hip','FL_1 thigh','FL_2 calf',
@@ -553,6 +655,7 @@ let _estop         = false;
 let _ctrlMotors    = [];
 let _showExtended  = false;
 let _showSystem    = false;
+let _histQActual = [], _histQTarget = [], _histDq = [], _histTau = [];
 
 // ============================================================
 // Build motor cards
@@ -611,6 +714,12 @@ function selectJoint(idx) {
   updateSliderLimits(idx);
   syncSlidersFromCtrl(idx);
   updateCardBorders();
+  // Clear signal history when switching joints
+  _histQActual.length = _histQTarget.length = _histDq.length = _histTau.length = 0;
+  drawAllCharts();
+  const title = 'Motor ' + idx + ' — ' + MOTOR_NAMES[idx];
+  document.getElementById('gauges-title').textContent  = 'Live Gauges — ' + title;
+  document.getElementById('charts-title').textContent  = 'Signal History — ' + title;
 }
 
 function updateSliderLimits(idx) {
@@ -742,12 +851,42 @@ function onStatus(s) {
   updatePower(s);
   if (s.bms)                               updateBMS(s.bms);
 
+  // Sync freq slider
+  if (ctrl.freq != null) {
+    const fs = document.getElementById('freq-slider');
+    if (document.activeElement !== fs) {
+      fs.value = Math.round(ctrl.freq);
+      document.getElementById('freq-val').textContent = Math.round(ctrl.freq) + ' Hz';
+    }
+  }
+
+  // Live gauges for selected joint
+  const selMot  = (s.motors || [])[_selectedJoint] || {};
+  const ctrlMot = (_ctrlMotors[_selectedJoint] || {});
+  const qAct = selMot.q     != null ? selMot.q     : null;
+  const qTgt = ctrlMot.q_des != null ? ctrlMot.q_des : (ctrlMot.q != null ? ctrlMot.q : null);
+  const qErr = (qAct != null && qTgt != null) ? (qAct - qTgt) : null;
+  setGauge('g-q-act', qAct, 4);
+  setGauge('g-q-tgt', qTgt, 4);
+  setGauge('g-q-err', qErr, 4);
+  setGauge('g-dq',   selMot.dq      != null ? selMot.dq      : null, 4);
+  setGauge('g-tau',  selMot.tau_est != null ? selMot.tau_est : null, 3);
+  setGauge('g-temp', selMot.temperature != null ? selMot.temperature : null, 1);
+
+  // Signal history
+  if (qAct != null) { _histQActual.push(qAct);  if (_histQActual.length > CHART_HISTORY) _histQActual.shift(); }
+  if (qTgt != null) { _histQTarget.push(qTgt);  if (_histQTarget.length > CHART_HISTORY) _histQTarget.shift(); }
+  if (selMot.dq != null)      { _histDq.push(selMot.dq);       if (_histDq.length  > CHART_HISTORY) _histDq.shift(); }
+  if (selMot.tau_est != null) { _histTau.push(selMot.tau_est); if (_histTau.length > CHART_HISTORY) _histTau.shift(); }
+  drawAllCharts();
+
   const selQ   = (s.motors || [])[_selectedJoint];
   const ctrlQ  = (_ctrlMotors[_selectedJoint] || {});
   document.getElementById('sb-tick').textContent =
     'joint=' + _selectedJoint +
     '  q=' + (selQ && selQ.q != null ? selQ.q.toFixed(4) : '—') + ' rad' +
-    '  ctrl_q=' + (ctrlQ.q != null ? ctrlQ.q.toFixed(4) : '—') + ' rad';
+    '  ctrl_q=' + (ctrlQ.q != null ? ctrlQ.q.toFixed(4) : '—') + ' rad' +
+    '  freq=' + (ctrl.freq != null ? Math.round(ctrl.freq) + ' Hz' : '—');
 }
 
 // ============================================================
@@ -904,23 +1043,23 @@ function toggleService(name) {
 // ============================================================
 function onQSlider(val) {
   document.getElementById('q-slider-val').textContent = parseFloat(val).toFixed(2);
-  sendCmd({ q: parseFloat(val) });
+  if (_enabled) sendCmd({ q: parseFloat(val) });
 }
 function onDqSlider(val) {
   document.getElementById('dq-slider-val').textContent = parseFloat(val).toFixed(1);
-  sendCmd({ dq: parseFloat(val) });
+  if (_enabled) sendCmd({ dq: parseFloat(val) });
 }
 function onKpSlider(val) {
   document.getElementById('kp-slider-val').textContent = parseFloat(val).toFixed(1);
-  sendCmd({ kp: parseFloat(val) });
+  if (_enabled) sendCmd({ kp: parseFloat(val) });
 }
 function onKdSlider(val) {
   document.getElementById('kd-slider-val').textContent = parseFloat(val).toFixed(2);
-  sendCmd({ kd: parseFloat(val) });
+  if (_enabled) sendCmd({ kd: parseFloat(val) });
 }
 function onTauSlider(val) {
   document.getElementById('tau-slider-val').textContent = parseFloat(val).toFixed(1);
-  sendCmd({ tau: parseFloat(val) });
+  if (_enabled) sendCmd({ tau: parseFloat(val) });
 }
 
 function sendCmd(overrides) {
@@ -959,6 +1098,98 @@ function toggleEstop() {
   if (_estop) clearEstop();
   else triggerEstop();
 }
+
+// ============================================================
+// Freq slider
+// ============================================================
+function onFreqSlider(val) {
+  document.getElementById('freq-val').textContent = val + ' Hz';
+  post('/api/freq', { freq: parseInt(val, 10) });
+}
+
+// ============================================================
+// Gauge helper
+// ============================================================
+function setGauge(id, val, decimals) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = val != null ? parseFloat(val).toFixed(decimals) : '—';
+}
+
+// ============================================================
+// Signal-history charts
+// ============================================================
+function _autoRange(data, minSpan) {
+  if (!data.length) return [-1, 1];
+  let lo = Infinity, hi = -Infinity;
+  for (let v of data) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Math.max(hi - lo, minSpan);
+  const pad  = span * 0.12;
+  return [lo - pad, hi + pad];
+}
+
+function drawOneChart(id, series, yMin, yMax, gridVals) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const W = canvas.clientWidth  || 400;
+  const H = canvas.clientHeight || 110;
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#0f1117';
+  ctx.fillRect(0, 0, W, H);
+  const PAD_L = 42, PAD_R = 6, PAD_T = 6, PAD_B = 6;
+  const PW = W - PAD_L - PAD_R;
+  const PH = H - PAD_T - PAD_B;
+  const range = yMax - yMin || 1;
+  function toX(i, total) { return PAD_L + (total <= 1 ? PW/2 : i / (total - 1) * PW); }
+  function toY(v)         { return PAD_T + PH * (1 - (v - yMin) / range); }
+  // Grid lines
+  if (gridVals) {
+    ctx.strokeStyle = '#21252f'; ctx.lineWidth = 1;
+    ctx.fillStyle   = '#5a6070'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
+    for (let g of gridVals) {
+      const gy = Math.round(toY(g)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(W - PAD_R, gy); ctx.stroke();
+      ctx.fillText(g.toFixed(2), PAD_L - 3, gy + 3);
+    }
+  }
+  // Data series
+  const COLORS = ['#4f8ef7', '#3ecf6e'];
+  for (let s = 0; s < series.length; s++) {
+    const data = series[s];
+    if (!data.length) continue;
+    ctx.strokeStyle = COLORS[s % COLORS.length]; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < data.length; i++) {
+      const x = toX(i, data.length), y = toY(data[i]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawAllCharts() {
+  const limits = JOINT_LIMITS[_selectedJoint];
+  const qGrids = [
+    parseFloat(limits[0].toFixed(2)), 0,
+    parseFloat(limits[1].toFixed(2))
+  ].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
+  drawOneChart('chart-q',
+    [_histQActual, _histQTarget],
+    limits[0], limits[1], qGrids);
+
+  const dqR   = _autoRange(_histDq, 0.5);
+  const dqGrid = [parseFloat(dqR[0].toFixed(2)), 0, parseFloat(dqR[1].toFixed(2))]
+    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
+  drawOneChart('chart-dq',  [_histDq],  dqR[0],  dqR[1],  dqGrid);
+
+  const tauR  = _autoRange(_histTau, 1.0);
+  const tauGrid = [parseFloat(tauR[0].toFixed(2)), 0, parseFloat(tauR[1].toFixed(2))]
+    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
+  drawOneChart('chart-tau', [_histTau], tauR[0], tauR[1], tauGrid);
+}
+
+window.addEventListener('resize', drawAllCharts);
 
 // ============================================================
 // Fetch helper

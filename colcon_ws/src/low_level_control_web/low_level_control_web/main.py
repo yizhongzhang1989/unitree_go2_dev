@@ -20,6 +20,7 @@ import uvicorn
 
 from low_level_control_web.status_node import ControlNode
 from low_level_control_web.web_server import app, set_status_capture, _ServicePoller, set_service_poller
+from go2_common.config import load_config
 
 
 def main(args=None) -> None:
@@ -28,6 +29,7 @@ def main(args=None) -> None:
     if '--ros-args' in argv:
         argv = argv[:argv.index('--ros-args')]
 
+    cfg = load_config()
     parser = argparse.ArgumentParser(
         description='Go2 low-level motor status & control web dashboard'
     )
@@ -40,10 +42,14 @@ def main(args=None) -> None:
         help='Web server port (default: 8083)',
     )
     parser.add_argument(
-        '--network-interface', default=None, dest='network_interface',
-        help='Network interface for Unitree SDK DDS (e.g. eth0). Optional.',
+        '--network-interface', default=cfg.network_interface, dest='network_interface',
+        help='Network interface for Unitree SDK DDS (e.g. eth0). '
+             'Defaults to value in ~/.config/go2/robot.yaml.',
     )
     parsed = parser.parse_args(argv)
+    # Empty string from launch file (default_value='') should fall back to config.
+    if not parsed.network_interface:
+        parsed.network_interface = cfg.network_interface
 
     # Initialise rclpy and create the control node.
     rclpy.init()

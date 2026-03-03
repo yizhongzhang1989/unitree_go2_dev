@@ -10,14 +10,17 @@ import signal
 
 import uvicorn
 
+from go2_common.config import load_config
 from go2_cam_web.camera_node import CameraCapture
 from go2_cam_web.web_server import app, set_camera_node
 
 
 def main(args=None) -> None:
+    cfg = load_config()
     parser = argparse.ArgumentParser(description='Go2 camera web stream')
-    parser.add_argument('--network-interface', default='',
-                        help='Network interface connected to Go2 (e.g. eth0)')
+    parser.add_argument('--network-interface', default=cfg.network_interface or '',
+                        help='Network interface connected to Go2 (e.g. eth0). '
+                             'Defaults to value in ~/.config/go2/robot.yaml.')
     parser.add_argument('--host', default='0.0.0.0',
                         help='Web server bind host (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8080,
@@ -27,6 +30,9 @@ def main(args=None) -> None:
     parser.add_argument('--jpeg-quality', type=int, default=80,
                         help='JPEG quality 1-100 (default: 80)')
     parsed = parser.parse_args(args)
+    # Empty string from launch file (default_value='') should fall back to config.
+    if not parsed.network_interface:
+        parsed.network_interface = cfg.network_interface
 
     # --- Start camera capture in a separate spawned process ---
     capture = CameraCapture(

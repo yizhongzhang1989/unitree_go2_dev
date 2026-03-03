@@ -13,18 +13,22 @@ import sys
 
 import uvicorn
 
+from go2_common.config import load_config
 from go2_service_web.service_manager import ServiceManager
 from go2_service_web.web_server import app, set_manager
 
 
 def main(args=None) -> None:
+    cfg = load_config()
     parser = argparse.ArgumentParser(description='Go2 service manager web dashboard')
     parser.add_argument('--host', default='0.0.0.0',
                         help='Bind address (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8085,
                         help='HTTP port (default: 8085)')
-    parser.add_argument('--network-interface', default=None, dest='network_interface',
-                        help='Network interface for Unitree DDS (e.g. eth0)')
+    parser.add_argument('--network-interface', default=cfg.network_interface,
+                        dest='network_interface',
+                        help='Network interface for Unitree DDS (e.g. eth0). '
+                             'Defaults to value in ~/.config/go2/robot.yaml.')
 
     # ROS2 launch appends "--ros-args -r __node:=..." — strip everything from
     # "--ros-args" onward so argparse doesn't choke on unknown flags.
@@ -34,6 +38,9 @@ def main(args=None) -> None:
         args = args[:args.index('--ros-args')]
 
     parsed = parser.parse_args(args)
+    # Empty string from launch file (default_value='') should fall back to config.
+    if not parsed.network_interface:
+        parsed.network_interface = cfg.network_interface
 
     mgr = ServiceManager(network_interface=parsed.network_interface)
     set_manager(mgr)

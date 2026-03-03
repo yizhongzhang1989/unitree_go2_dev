@@ -1,0 +1,21 @@
+# Unitree Go2 robot configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is read by go2_common.config.get_network_interface().
+# The file is located at:  <workspace>/config/robot.yaml
+#
+# Setup: copy this template to robot.yaml in the same folder and edit it.
+#   cp config/robot.yaml.template config/robot.yaml
+#
+# You can also override any setting at runtime with an environment variable:
+#   export GO2_NETWORK_INTERFACE=enx606d3cbabf1b
+#
+# Format: simple "key: value" lines; lines starting with # are comments.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Network interface on the host that is connected to the Go2 robot.
+# Run `ip link` or `ifconfig` to find the right name.
+# Examples:
+#   enx606d3cbabf1b   (USB-Ethernet dongle — most common)
+#   eth0              (built-in Ethernet)
+#   wlan0             (Wi-Fi — not recommended for low-latency control)
+network_interface: eth0

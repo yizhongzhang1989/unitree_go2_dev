@@ -16,6 +16,7 @@ import logging
 import signal
 import sys
 
+from go2_common.config import load_config
 from front_video_udp_web.camera_capture import CameraCapture, _NATIVE_W, _NATIVE_H
 from front_video_udp_web.web_server import MJPEGServer, set_camera_capture
 
@@ -27,10 +28,14 @@ logger = logging.getLogger(__name__)
 
 
 def main(args=None):
+    cfg = load_config()
     parser = argparse.ArgumentParser(description='front_video_udp_web')
     parser.add_argument(
-        '--network-interface', required=True, dest='network_interface',
-        help='Network interface connected to the Go2 (e.g. enx606d3cbabf1b)',
+        '--network-interface', required=False,
+        default=cfg.network_interface,
+        dest='network_interface',
+        help='Network interface connected to the Go2 (e.g. enx606d3cbabf1b). '
+             'Defaults to value in ~/.config/go2/robot.yaml.',
     )
     parser.add_argument('--host', default='0.0.0.0',
                         help='Web server bind address (default: 0.0.0.0)')
@@ -45,6 +50,14 @@ def main(args=None):
                         help='JPEG encode quality 1-100 (default: 80)')
 
     parsed = parser.parse_args(args)
+    # Empty string from launch file (default_value='') should fall back to config.
+    if not parsed.network_interface:
+        parsed.network_interface = cfg.network_interface
+    if not parsed.network_interface:
+        parser.error(
+            'Network interface not specified. Either pass --network-interface '
+            'or set network_interface in config/robot.yaml'
+        )
 
     capture = CameraCapture(
         network_interface=parsed.network_interface,

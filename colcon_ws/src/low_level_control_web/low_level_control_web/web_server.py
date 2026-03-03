@@ -16,11 +16,12 @@ Routes:
 import asyncio
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
 from typing import Set
+
+from go2_common.service_client import ServiceClient
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -42,89 +43,14 @@ def set_status_capture(capture) -> None:
 # ---------------------------------------------------------------------------
 
 _TARGET_SERVICES = ('mcf', 'sport_mode', 'advanced_sport', 'ai_sport')
-_HELPER = os.path.join(os.path.dirname(__file__), '_service_helper.py')
-_POLL_INTERVAL = 2.0
-_SDK_ENV = {
-    **os.environ,
-    'LD_LIBRARY_PATH': '/usr/local/lib' + (
-        (':' + os.environ['LD_LIBRARY_PATH']) if 'LD_LIBRARY_PATH' in os.environ else ''
-    ),
-}
 
 
-class _ServicePoller:
-    """Background thread that polls the 4 target services every POLL_INTERVAL seconds."""
-
-    def __init__(self, network_interface=None):
-        self._iface    = network_interface
-        self._lock     = threading.Lock()
-        self._state    = {}
-        self._error    = None
-        self._last_upd = 0.0
-        self._thread   = threading.Thread(
-            target=self._loop, daemon=True, name='svc_poller')
-        self._thread.start()
-
-    def _call_helper(self, *args):
-        cmd = [sys.executable, _HELPER] + list(args)
-        if self._iface:
-            cmd.append(self._iface)
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, env=_SDK_ENV, timeout=10)
-        raw = (proc.stdout or '').strip()
-        for i, ch in enumerate(raw):
-            if ch in ('{', '['):
-                try:
-                    return json.loads(raw[i:])
-                except json.JSONDecodeError:
-                    continue
-        return {'error': (raw or proc.stderr or 'no output').strip()[:300]}
-
-    def _poll(self):
-        try:
-            data = self._call_helper('list')
-            if isinstance(data, list):
-                state = {}
-                for s in data:
-                    if s['name'] in _TARGET_SERVICES:
-                        state[s['name']] = {
-                            'status':  s['status'],
-                            'protect': s.get('protect', False),
-                        }
-                with self._lock:
-                    self._state    = state
-                    self._error    = None
-                    self._last_upd = time.time()
-            elif 'error' in data:
-                with self._lock:
-                    self._error = data['error']
-        except Exception as exc:
-            with self._lock:
-                self._error = str(exc)
-
-    def _loop(self):
-        while True:
-            self._poll()
-            time.sleep(_POLL_INTERVAL)
-
-    def get_services(self) -> dict:
-        with self._lock:
-            return {
-                'services':    dict(self._state),
-                'error':       self._error,
-                'last_update': self._last_upd,
-            }
-
-    def switch(self, name: str, on: bool) -> dict:
-        val = '1' if on else '0'
-        try:
-            result = self._call_helper('switch', name, val)
-        except Exception as exc:
-            return {'error': str(exc)}
-        threading.Thread(target=self._poll, daemon=True).start()
-        if result.get('code', -1) == 0:
-            return {'ok': True}
-        return {'error': result.get('error', f'code={result.get("code")}')}
+def _ServicePoller(network_interface=None) -> ServiceClient:
+    """Factory that returns a ServiceClient filtered to the 4 required services."""
+    return ServiceClient(
+        network_interface=network_interface,
+        target_services=_TARGET_SERVICES,
+    )
 
 
 _svc_poller = None

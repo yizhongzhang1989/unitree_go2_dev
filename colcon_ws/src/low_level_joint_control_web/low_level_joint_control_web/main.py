@@ -15,11 +15,13 @@ import threading
 import rclpy
 import uvicorn
 
+from go2_common.config import load_config
 from low_level_joint_control_web.control_node import JointControlNode
 from low_level_joint_control_web.web_server import app, set_node, _ServicePoller, set_service_poller
 
 
 def main(args=None) -> None:
+    cfg = load_config()
     parser = argparse.ArgumentParser(
         description='Go2 single-joint web controller'
     )
@@ -27,10 +29,14 @@ def main(args=None) -> None:
                         help='Web server bind address (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=8084,
                         help='Web server port (default: 8084)')
-    parser.add_argument('--network-interface', default=None,
+    parser.add_argument('--network-interface', default=cfg.network_interface,
                         dest='network_interface',
-                        help='Network interface for Unitree DDS (e.g. eth0). Optional.')
+                        help='Network interface for Unitree DDS (e.g. eth0). '
+                             'Defaults to value in ~/.config/go2/robot.yaml.')
     parsed = parser.parse_args(args)
+    # Empty string from launch file (default_value='') should fall back to config.
+    if not parsed.network_interface:
+        parsed.network_interface = cfg.network_interface
 
     rclpy.init()
     node = JointControlNode(network_interface=parsed.network_interface)

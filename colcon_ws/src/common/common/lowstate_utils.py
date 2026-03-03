@@ -1,8 +1,8 @@
 """lowstate_utils.py — Shared helpers for parsing LowState messages.
 
-Used by all packages that subscribe to /lowstate (low_level_status_web,
-low_level_control_web).  Centralises the motor-state, IMU, BMS, and
-full-payload conversion logic so it is not duplicated across packages.
+Used by all packages that subscribe to /lowstate (e.g. low_level_control_web).
+Centralises the motor-state, IMU, BMS, and full-payload conversion logic so it
+is not duplicated across packages.
 """
 
 # Motor joint names for the Go2 (indices 0-11).

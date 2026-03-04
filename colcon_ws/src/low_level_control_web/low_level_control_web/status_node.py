@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time as _time
 from pathlib import Path
 from typing import Optional
 
@@ -117,6 +118,11 @@ class ControlNode(Node):
         # Per-motor current commanded position for display
         self._q_des: list = [0.0] * 12
 
+        # Recording state
+        self._recording: bool = False
+        self._record_buf: list[dict] = []   # list of flat dicts (one per frame)
+        self._record_t0: float = 0.0        # monotonic start time
+
         # ROS subscriptions / publications
         self.create_subscription(LowState, '/lowstate', self._state_cb, 10)
         self._cmd_pub = self.create_publisher(LowCmd, '/lowcmd', 10)
@@ -138,6 +144,8 @@ class ControlNode(Node):
         payload = lowstate_to_dict(msg)
         with self._lock:
             self._latest_status = payload
+            if self._recording:
+                self._record_frame(payload)
 
     def _publish_cmd(self) -> None:
         """Build and publish a LowCmd reflecting current control state."""
@@ -235,6 +243,86 @@ class ControlNode(Node):
     def shutdown(self) -> None:
         """Stop the background control thread."""
         self._stop_event.set()
+
+    # ------------------------------------------------------------------
+    # Recording
+    # ------------------------------------------------------------------
+
+    def _record_frame(self, s: dict) -> None:
+        """Flatten a lowstate dict into a single row and append to buffer.
+        Must be called while holding self._lock."""
+        t = _time.monotonic() - self._record_t0
+        row: dict = {'time': round(t, 6)}
+        # Motors 0-11
+        for i in range(12):
+            m = s['motors'][i] if i < len(s.get('motors', [])) else {}
+            for key in ('mode', 'q', 'dq', 'ddq', 'tau_est', 'q_raw', 'dq_raw',
+                        'ddq_raw', 'temperature', 'lost'):
+                row[f'motor{i}_{key}'] = m.get(key, '')
+        # IMU
+        imu = s.get('imu', {})
+        for j, name in enumerate(['w', 'x', 'y', 'z']):
+            row[f'imu_quat_{name}'] = imu.get('quaternion', [0]*4)[j] if j < len(imu.get('quaternion', [])) else ''
+        for j, name in enumerate(['x', 'y', 'z']):
+            row[f'imu_gyro_{name}'] = imu.get('gyroscope', [0]*3)[j] if j < len(imu.get('gyroscope', [])) else ''
+        for j, name in enumerate(['x', 'y', 'z']):
+            row[f'imu_acc_{name}'] = imu.get('accelerometer', [0]*3)[j] if j < len(imu.get('accelerometer', [])) else ''
+        for j, name in enumerate(['r', 'p', 'y']):
+            row[f'imu_rpy_{name}'] = imu.get('rpy', [0]*3)[j] if j < len(imu.get('rpy', [])) else ''
+        row['imu_temperature'] = imu.get('temperature', '')
+        # Foot force
+        ff = s.get('foot_force', [])
+        ffe = s.get('foot_force_est', [])
+        for j in range(4):
+            row[f'foot_force_{j}'] = ff[j] if j < len(ff) else ''
+            row[f'foot_force_est_{j}'] = ffe[j] if j < len(ffe) else ''
+        # Power / BMS
+        row['power_v'] = s.get('power_v', '')
+        row['power_a'] = s.get('power_a', '')
+        bms = s.get('bms', {})
+        row['bms_soc'] = bms.get('soc', '')
+        row['bms_current'] = bms.get('current', '')
+        row['tick'] = s.get('tick', '')
+        self._record_buf.append(row)
+
+    def start_recording(self) -> None:
+        """Start recording lowstate frames."""
+        with self._lock:
+            self._record_buf = []
+            self._record_t0 = _time.monotonic()
+            self._recording = True
+        self.get_logger().info('Recording started')
+
+    def stop_recording(self) -> int:
+        """Stop recording and return the number of frames captured."""
+        with self._lock:
+            self._recording = False
+            n = len(self._record_buf)
+        self.get_logger().info(f'Recording stopped — {n} frames')
+        return n
+
+    def get_recording_csv(self) -> str:
+        """Return the recorded data as a CSV string."""
+        with self._lock:
+            buf = list(self._record_buf)
+        if not buf:
+            return ''
+        import io, csv
+        headers = list(buf[0].keys())
+        out = io.StringIO()
+        w = csv.DictWriter(out, fieldnames=headers)
+        w.writeheader()
+        w.writerows(buf)
+        return out.getvalue()
+
+    def get_recording_state(self) -> dict:
+        """Return current recording state."""
+        with self._lock:
+            return {
+                'recording': self._recording,
+                'frames':    len(self._record_buf),
+                'duration':  round(_time.monotonic() - self._record_t0, 2) if self._recording else 0.0,
+            }
 
     def set_motor_cmd(self, idx: int, q: float, dq: float, tau: float,
                       kp: float, kd: float, enabled: bool) -> None:

@@ -192,6 +192,18 @@
     #drag-btn.on  { background: #f59e0b; color: #000; }
     #drag-btn.off { background: #2e3147; color: var(--text); }
 
+    #rec-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+    }
+    #rec-btn.recording { background: var(--red); color: #fff; animation: rec-pulse 1s infinite; }
+    #rec-btn.idle       { background: #2e3147;    color: var(--text); }
+    @keyframes rec-pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
+    #dl-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text);
+    }
+
     /* Right column — motor card grid */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
     .motor-grid {
@@ -517,6 +529,16 @@
       </div>
     </div>
 
+    <!-- Recording -->
+    <div class="card">
+      <div class="card-title">Recording</div>
+      <div class="btn-row" style="flex-direction:column;gap:10px;">
+        <button id="rec-btn" class="idle" onclick="toggleRecord()">&#9210; Start Recording</button>
+        <div id="rec-info" style="font-size:12px;color:var(--muted);display:none"></div>
+        <button id="dl-btn" onclick="downloadRecording()" disabled>&#11015; Download CSV</button>
+      </div>
+    </div>
+
   </div>
 
   <!-- ======== RIGHT: 12 motor cards ======== -->
@@ -643,6 +665,8 @@ let _showExtended  = false;
 let _showSystem    = false;
 let _showPlots     = false;
 let _dragMode      = false;
+let _isRecording   = false;
+let _recordFrames  = 0;
 // Per-motor signal history (12 motors × 4 signals)
 let _histQ   = Array.from({length:12}, () => []);
 let _histDq  = Array.from({length:12}, () => []);
@@ -872,6 +896,33 @@ function onStatus(s) {
   // E-stop buttons
   document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
   document.getElementById('clear-estop-btn').style.display = _estop ? '' : 'none';
+
+  // Recording state
+  var rec = s.recording || {};
+  _isRecording = rec.recording || false;
+  _recordFrames = rec.frames || 0;
+  var recBtn = document.getElementById('rec-btn');
+  var recInfo = document.getElementById('rec-info');
+  var dlBtn = document.getElementById('dl-btn');
+  if (_isRecording) {
+    recBtn.innerHTML = '&#9209; Stop Recording';
+    recBtn.className = 'recording';
+    recInfo.style.display = '';
+    recInfo.textContent = 'Recording: ' + _recordFrames + ' frames, ' + (rec.duration || 0).toFixed(1) + 's';
+    dlBtn.disabled = true;
+  } else {
+    recBtn.innerHTML = '&#9210; Start Recording';
+    recBtn.className = 'idle';
+    if (_recordFrames > 0) {
+      recInfo.style.display = '';
+      recInfo.textContent = 'Recorded: ' + _recordFrames + ' frames';
+      dlBtn.disabled = false;
+    } else {
+      recInfo.style.display = 'none';
+      dlBtn.disabled = true;
+    }
+  }
+
   const hdr = document.getElementById('hdr-estop');
   if (_estop) {
     hdr.textContent = 'E-STOP ACTIVE — Click to Clear';
@@ -1280,6 +1331,20 @@ function toggleEstop() {
 function onFreqSlider(val) {
   document.getElementById('freq-val').textContent = val + ' Hz';
   post('/api/freq', { freq: parseInt(val, 10) });
+}
+
+// ============================================================
+// Recording
+// ============================================================
+function toggleRecord() {
+  if (_isRecording) {
+    post('/api/record/stop', {});
+  } else {
+    post('/api/record/start', {});
+  }
+}
+function downloadRecording() {
+  window.location.href = '/api/record/download';
 }
 
 // ============================================================

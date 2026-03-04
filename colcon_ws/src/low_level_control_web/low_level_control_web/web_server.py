@@ -7,6 +7,10 @@ Routes:
   POST   /api/cmd                → set target for one motor  (body: MotorCmdRequest)
   POST   /api/estop              → activate emergency stop
   DELETE /api/estop              → clear emergency stop
+  POST   /api/record/start       → start recording lowstate frames
+  POST   /api/record/stop        → stop recording
+  GET    /api/record/download    → download recorded data as CSV
+  GET    /api/record/state       → current recording state
   GET    /api/services           → current status of 4 managed services
   POST   /api/service/{name}/start → start a service by name
   POST   /api/service/{name}/stop  → stop a service by name
@@ -25,7 +29,7 @@ from typing import Set
 from common.service_client import ServiceClient
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title='Go2 Low-Level Control')
@@ -131,6 +135,7 @@ async def _broadcaster() -> None:
             if status is not None:
                 try:
                     payload = {**status, 'control': ctrl}
+                    payload['recording'] = _status_capture.get_recording_state()
                     if _svc_poller is not None:
                         svc = _svc_poller.get_services()
                         payload['services']       = svc['services']
@@ -213,6 +218,43 @@ async def api_estop_off() -> JSONResponse:
         return JSONResponse({'error': 'not ready'}, status_code=503)
     _status_capture.set_estop(False)
     return JSONResponse({'ok': True, 'estop': False})
+
+
+@app.post('/api/record/start', response_class=JSONResponse)
+async def api_record_start() -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    _status_capture.start_recording()
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/record/stop', response_class=JSONResponse)
+async def api_record_stop() -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    n = _status_capture.stop_recording()
+    return JSONResponse({'ok': True, 'frames': n})
+
+
+@app.get('/api/record/download')
+async def api_record_download():
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    csv_data = _status_capture.get_recording_csv()
+    if not csv_data:
+        return JSONResponse({'error': 'no recording data'}, status_code=404)
+    return PlainTextResponse(
+        content=csv_data,
+        media_type='text/csv',
+        headers={'Content-Disposition': 'attachment; filename="recording.csv"'},
+    )
+
+
+@app.get('/api/record/state', response_class=JSONResponse)
+async def api_record_state() -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    return JSONResponse(_status_capture.get_recording_state())
 
 
 @app.get('/api/services', response_class=JSONResponse)

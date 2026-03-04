@@ -204,6 +204,20 @@
       font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text);
     }
 
+    /* Playback */
+    #play-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+    }
+    #play-btn.playing { background: #22c55e; color: #000; animation: rec-pulse 1s infinite; }
+    #play-btn.idle     { background: #2e3147; color: var(--text); }
+    #play-btn:disabled { opacity: .4; cursor: not-allowed; }
+    #upload-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text); cursor: pointer;
+    }
+    #csv-file { display: none; }
+
     /* Right column — motor card grid */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
     .motor-grid {
@@ -539,6 +553,17 @@
       </div>
     </div>
 
+    <!-- Playback -->
+    <div class="card">
+      <div class="card-title">Playback</div>
+      <div class="btn-row" style="flex-direction:column;gap:10px;">
+        <input type="file" id="csv-file" accept=".csv" onchange="uploadCSV(this)">
+        <button id="upload-btn" onclick="document.getElementById('csv-file').click()">&#128194; Upload CSV</button>
+        <div id="pb-info" style="font-size:12px;color:var(--muted);display:none"></div>
+        <button id="play-btn" class="idle" onclick="togglePlayback()" disabled>&#9654; Play</button>
+      </div>
+    </div>
+
   </div>
 
   <!-- ======== RIGHT: 12 motor cards ======== -->
@@ -667,6 +692,8 @@ let _showPlots     = false;
 let _dragMode      = false;
 let _isRecording   = false;
 let _recordFrames  = 0;
+let _isPlaying     = false;
+let _playbackLoaded = false;
 // Per-motor signal history (12 motors × 4 signals)
 let _histQ   = Array.from({length:12}, () => []);
 let _histDq  = Array.from({length:12}, () => []);
@@ -920,6 +947,28 @@ function onStatus(s) {
     } else {
       recInfo.style.display = 'none';
       dlBtn.disabled = true;
+    }
+  }
+
+  // Playback state
+  var pb = (s.control && s.control.playback) || {};
+  _isPlaying = pb.active || false;
+  _playbackLoaded = pb.loaded || false;
+  var playBtn = document.getElementById('play-btn');
+  var pbInfo  = document.getElementById('pb-info');
+  if (_isPlaying) {
+    playBtn.innerHTML = '&#9724; Stop';
+    playBtn.className = 'playing';
+    playBtn.disabled = false;
+    pbInfo.style.display = '';
+    pbInfo.textContent = 'Playing: ' + (pb.elapsed || 0).toFixed(1) + 's / ' + (pb.duration || 0).toFixed(1) + 's';
+  } else {
+    playBtn.innerHTML = '&#9654; Play';
+    playBtn.className = 'idle';
+    playBtn.disabled = !_playbackLoaded;
+    if (_playbackLoaded && pb.duration > 0) {
+      pbInfo.style.display = '';
+      pbInfo.textContent = 'Loaded: ' + (pb.duration || 0).toFixed(1) + 's trajectory';
     }
   }
 
@@ -1345,6 +1394,37 @@ function toggleRecord() {
 }
 function downloadRecording() {
   window.location.href = '/api/record/download';
+}
+
+// ============================================================
+// Playback
+// ============================================================
+function uploadCSV(input) {
+  if (!input.files.length) return;
+  var fd = new FormData();
+  fd.append('file', input.files[0]);
+  fetch('/api/playback/upload', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.ok) {
+        _playbackLoaded = true;
+        var info = document.getElementById('pb-info');
+        info.style.display = '';
+        info.textContent = 'Loaded: ' + j.frames + ' frames, ' + j.duration.toFixed(1) + 's';
+        document.getElementById('play-btn').disabled = false;
+      } else {
+        alert('Upload failed: ' + (j.error || 'unknown'));
+      }
+    })
+    .catch(e => alert('Upload error: ' + e));
+  input.value = '';  // allow re-upload of same file
+}
+function togglePlayback() {
+  if (_isPlaying) {
+    post('/api/playback/stop', {});
+  } else {
+    post('/api/playback/start', {});
+  }
 }
 
 // ============================================================

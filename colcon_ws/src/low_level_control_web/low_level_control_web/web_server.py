@@ -28,7 +28,7 @@ from typing import Set
 
 from common.service_client import ServiceClient
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -255,6 +255,40 @@ async def api_record_state() -> JSONResponse:
     if _status_capture is None:
         return JSONResponse({'error': 'not ready'}, status_code=503)
     return JSONResponse(_status_capture.get_recording_state())
+
+
+# ── Playback ────────────────────────────────────────────────
+
+@app.post('/api/playback/upload', response_class=JSONResponse)
+async def api_playback_upload(file: UploadFile = File(...)) -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    raw = await file.read()
+    text = raw.decode('utf-8', errors='replace')
+    try:
+        result = _status_capture.load_playback_csv(text)
+    except (ValueError, KeyError, Exception) as exc:
+        return JSONResponse({'ok': False, 'error': str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post('/api/playback/start', response_class=JSONResponse)
+async def api_playback_start() -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    try:
+        _status_capture.start_playback()
+    except ValueError as exc:
+        return JSONResponse({'ok': False, 'error': str(exc)}, status_code=400)
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/playback/stop', response_class=JSONResponse)
+async def api_playback_stop() -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    _status_capture.stop_playback()
+    return JSONResponse({'ok': True})
 
 
 @app.get('/api/services', response_class=JSONResponse)

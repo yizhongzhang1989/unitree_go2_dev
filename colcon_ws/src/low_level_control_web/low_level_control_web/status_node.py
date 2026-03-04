@@ -123,6 +123,14 @@ class ControlNode(Node):
         self._record_buf: list[dict] = []   # list of flat dicts (one per frame)
         self._record_t0: float = 0.0        # monotonic start time
 
+        # Playback state
+        self._playback_active: bool = False
+        self._playback_t0: float = 0.0       # monotonic start time
+        self._playback_duration: float = 0.0 # total duration of loaded trajectory
+        self._playback_loaded: bool = False   # whether a trajectory is loaded
+        # Per-motor trajectory: list of 12, each a list of (time, q, dq) tuples sorted by time
+        self._playback_traj: list[list[tuple]] = [[] for _ in range(12)]
+
         # ROS subscriptions / publications
         self.create_subscription(LowState, '/lowstate', self._state_cb, 10)
         self._cmd_pub = self.create_publisher(LowCmd, '/lowcmd', 10)
@@ -157,6 +165,21 @@ class ControlNode(Node):
             drag_en = list(self._drag_enabled)
             drag_lim = list(self._drag_tau_limit)
             status = self._latest_status
+            # Playback: interpolate q and dq by elapsed time
+            pb_active = self._playback_active
+            if pb_active:
+                elapsed = _time.monotonic() - self._playback_t0
+                if elapsed >= self._playback_duration:
+                    # Playback finished
+                    self._playback_active = False
+                    pb_active = False
+                else:
+                    for i in range(12):
+                        traj = self._playback_traj[i]
+                        if traj and cmds[i]['enabled']:
+                            q_interp, dq_interp = self._interp_traj(traj, elapsed)
+                            cmds[i]['q'] = q_interp
+                            cmds[i]['dq'] = dq_interp
 
         # Drag mode: update position targets for joints where |tau_est| > limit
         if status is not None:
@@ -209,6 +232,10 @@ class ControlNode(Node):
                 # Persist yielded position back so next tick starts from here
                 if cmds[i]['enabled'] and drag_en[i]:
                     self._motor_cmds[i]['q'] = cmds[i]['q']
+                # Persist playback-interpolated position so slider display stays in sync
+                if pb_active and cmds[i]['enabled']:
+                    self._motor_cmds[i]['q'] = cmds[i]['q']
+                    self._motor_cmds[i]['dq'] = cmds[i]['dq']
 
         cmd.crc = _compute_crc(cmd)
         self._cmd_pub.publish(cmd)
@@ -238,6 +265,12 @@ class ControlNode(Node):
                      'drag_tau_limit': self._drag_tau_limit[i]}
                     for i, c in enumerate(self._motor_cmds)
                 ],
+                'playback': {
+                    'loaded':   self._playback_loaded,
+                    'active':   self._playback_active,
+                    'duration': round(self._playback_duration, 3),
+                    'elapsed':  round(_time.monotonic() - self._playback_t0, 3) if self._playback_active else 0.0,
+                },
             }
 
     def shutdown(self) -> None:
@@ -322,6 +355,100 @@ class ControlNode(Node):
                 'recording': self._recording,
                 'frames':    len(self._record_buf),
                 'duration':  round(_time.monotonic() - self._record_t0, 2) if self._recording else 0.0,
+            }
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _interp_traj(traj: list[tuple], t: float) -> tuple[float, float]:
+        """Linearly interpolate (q, dq) from a sorted trajectory at time *t*.
+
+        *traj* is a list of (time, q, dq) tuples sorted by time.
+        Returns (q, dq) at time *t*.
+        """
+        if not traj:
+            return 0.0, 0.0
+        if t <= traj[0][0]:
+            return traj[0][1], traj[0][2]
+        if t >= traj[-1][0]:
+            return traj[-1][1], traj[-1][2]
+        # Binary search for the interval
+        lo, hi = 0, len(traj) - 1
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if traj[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        t0, q0, dq0 = traj[lo]
+        t1, q1, dq1 = traj[hi]
+        dt = t1 - t0
+        if dt < 1e-9:
+            return q1, dq1
+        alpha = (t - t0) / dt
+        return q0 + alpha * (q1 - q0), dq0 + alpha * (dq1 - dq0)
+
+    def load_playback_csv(self, csv_text: str) -> dict:
+        """Parse a CSV string (same format as recording) into playback trajectories.
+
+        Returns {'ok': True, 'duration': ..., 'frames': ...} or raises ValueError.
+        """
+        import csv, io
+        reader = csv.DictReader(io.StringIO(csv_text))
+        rows = list(reader)
+        if not rows:
+            raise ValueError('CSV is empty')
+        # Check required columns
+        if 'time' not in rows[0]:
+            raise ValueError('CSV must have a "time" column')
+        traj: list[list[tuple]] = [[] for _ in range(12)]
+        for row in rows:
+            t = float(row['time'])
+            for i in range(12):
+                q_key  = f'motor{i}_q'
+                dq_key = f'motor{i}_dq'
+                if q_key in row and row[q_key] != '':
+                    q_val  = float(row[q_key])
+                    dq_val = float(row[dq_key]) if dq_key in row and row[dq_key] != '' else 0.0
+                    traj[i].append((t, q_val, dq_val))
+        # Sort by time (should already be sorted, but ensure)
+        for i in range(12):
+            traj[i].sort(key=lambda x: x[0])
+        duration = max((tr[-1][0] if tr else 0.0) for tr in traj)
+        with self._lock:
+            self._playback_traj = traj
+            self._playback_duration = duration
+            self._playback_loaded = True
+            self._playback_active = False
+        n_frames = len(rows)
+        self.get_logger().info(f'Playback trajectory loaded: {n_frames} frames, {duration:.2f}s')
+        return {'ok': True, 'duration': round(duration, 3), 'frames': n_frames}
+
+    def start_playback(self) -> None:
+        """Start playback from the beginning."""
+        with self._lock:
+            if not self._playback_loaded:
+                raise ValueError('No trajectory loaded')
+            self._playback_t0 = _time.monotonic()
+            self._playback_active = True
+        self.get_logger().info('Playback started')
+
+    def stop_playback(self) -> None:
+        """Stop playback."""
+        with self._lock:
+            self._playback_active = False
+        self.get_logger().info('Playback stopped')
+
+    def get_playback_state(self) -> dict:
+        """Return current playback state."""
+        with self._lock:
+            return {
+                'loaded':   self._playback_loaded,
+                'active':   self._playback_active,
+                'duration': round(self._playback_duration, 3),
+                'elapsed':  round(_time.monotonic() - self._playback_t0, 3) if self._playback_active else 0.0,
             }
 
     def set_motor_cmd(self, idx: int, q: float, dq: float, tau: float,

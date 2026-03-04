@@ -80,6 +80,12 @@ class FreqRequest(BaseModel):
     freq: float             # Hz, clamped to 1–500
 
 
+class DragRequest(BaseModel):
+    motor_idx: int          # 0–11
+    enabled:   bool
+    tau_limit: float | None = None   # Nm; if omitted keeps current limit
+
+
 # ---------------------------------------------------------------------------
 # WebSocket manager
 # ---------------------------------------------------------------------------
@@ -179,6 +185,17 @@ async def api_freq(req: FreqRequest) -> JSONResponse:
     if _status_capture is None:
         return JSONResponse({'error': 'not ready'}, status_code=503)
     _status_capture.set_freq(req.freq)
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/drag', response_class=JSONResponse)
+async def api_drag(req: DragRequest) -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    try:
+        _status_capture.set_drag(req.motor_idx, req.enabled, req.tau_limit)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
     return JSONResponse({'ok': True})
 
 

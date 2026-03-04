@@ -128,6 +128,15 @@
       min-width: 60px; text-align: right;
       font-size: 15px; font-weight: 600; color: var(--accent);
     }
+    .slider-val-input {
+      width: 70px; text-align: right;
+      font-size: 14px; font-weight: 600;
+      background: var(--bg); color: inherit;
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 1px 4px; outline: none;
+      font-family: inherit;
+    }
+    .slider-val-input:focus { border-color: var(--accent); }
 
     /* Service table */
     .svc-table { width: 100%; border-collapse: collapse; }
@@ -175,6 +184,13 @@
       font-size: 13px; font-weight: 600;
       background: #2e3147; color: var(--text);
     }
+
+    #drag-btn {
+      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
+      font-size: 13px; font-weight: 600;
+    }
+    #drag-btn.on  { background: #f59e0b; color: #000; }
+    #drag-btn.off { background: #2e3147; color: var(--text); }
 
     /* Right column — motor card grid */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
@@ -309,14 +325,17 @@
     }
     .gauge-unit { font-size: 10px; color: var(--muted); margin-left: 2px; }
 
-    /* ---- Signal-history charts ---- */
-    .chart-block { display: flex; flex-direction: column; gap: 0; }
-    .chart-row   { display: flex; flex-direction: column; gap: 4px; padding-bottom: 10px; }
-    .chart-row:last-child { padding-bottom: 0; }
-    .chart-label { font-size: 10px; font-weight: 600; letter-spacing: .06em;
-                   text-transform: uppercase; color: var(--muted); }
-    .chart-wrap  { height: 110px; position: relative; }
-    .chart-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 4px; }
+    /* ---- All-motor plots inside motor cards ---- */
+    .mc-plots { display: none; margin-top: 6px; }
+    .motor-grid.show-plots .mc-plots { display: block; }
+    .mc-plot-row { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
+    .mc-plot-lbl {
+      font-size: 8px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em;
+      color: var(--muted); width: 22px; flex-shrink: 0;
+    }
+    .mc-plot-wrap { height: 40px; flex: 1; position: relative; }
+    .mc-plot-wrap canvas { width: 100%; height: 100%; display: block; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -335,6 +354,7 @@
     <span class="svc-strip-label">View:</span>
     <button class="toggle-btn" id="toggle-ext-btn" onclick="toggleExtended()">Extended Motors</button>
     <button class="toggle-btn" id="toggle-sys-btn" onclick="toggleSystem()">System Info</button>
+    <button class="toggle-btn" id="toggle-plot-btn" onclick="togglePlots()">Motor Plots</button>
   </div>
   <button id="hdr-estop" class="cleared" onclick="toggleEstop()">&#9888; E-STOP</button>
 </header>
@@ -387,12 +407,16 @@
         <div class="slider-row">
           <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
             <span style="font-size:12px;font-weight:700;color:var(--accent)">q &mdash; Position (rad)</span>
-            <span style="font-size:11px;color:var(--muted)" id="q-range-lbl">—</span>
+            <span style="display:flex;align-items:baseline;gap:8px">
+              <button onclick="setCurrentQ()" style="font-size:10px;padding:1px 6px;border:1px solid var(--accent);background:transparent;color:var(--accent);border-radius:3px;cursor:pointer;font-family:inherit" title="Set slider to actual joint position">Set Current</button>
+              <span style="font-size:11px;color:var(--muted)" id="q-range-lbl">—</span>
+            </span>
           </div>
           <div class="slider-value-row">
             <input type="range" id="q-slider" min="-3.14" max="3.14" step="0.01"
                    value="0" oninput="onQSlider(this.value)"/>
-            <span class="slider-val" id="q-slider-val">0.00</span>
+            <input class="slider-val-input" id="q-slider-val" value="0.00"
+                   onchange="onSliderInput('q', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -405,7 +429,8 @@
           <div class="slider-value-row">
             <input type="range" id="dq-slider" min="-20" max="20" step="0.1"
                    value="0" oninput="onDqSlider(this.value)"/>
-            <span class="slider-val" id="dq-slider-val" style="color:#a78bfa">0.0</span>
+            <input class="slider-val-input" id="dq-slider-val" style="color:#a78bfa" value="0.0"
+                   onchange="onSliderInput('dq', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -418,7 +443,8 @@
           <div class="slider-value-row">
             <input type="range" id="kp-slider" min="0" max="100" step="0.5"
                    value="60" oninput="onKpSlider(this.value)"/>
-            <span class="slider-val" id="kp-slider-val" style="color:var(--text)">60.0</span>
+            <input class="slider-val-input" id="kp-slider-val" style="color:var(--text)" value="60.0"
+                   onchange="onSliderInput('kp', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -431,7 +457,8 @@
           <div class="slider-value-row">
             <input type="range" id="kd-slider" min="0" max="10" step="0.05"
                    value="5" oninput="onKdSlider(this.value)"/>
-            <span class="slider-val" id="kd-slider-val" style="color:var(--muted)">5.00</span>
+            <input class="slider-val-input" id="kd-slider-val" style="color:var(--muted)" value="5.00"
+                   onchange="onSliderInput('kd', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -444,7 +471,8 @@
           <div class="slider-value-row">
             <input type="range" id="tau-slider" min="-23" max="23" step="0.1"
                    value="0" oninput="onTauSlider(this.value)"/>
-            <span class="slider-val" id="tau-slider-val" style="color:var(--yellow)">0.0</span>
+            <input class="slider-val-input" id="tau-slider-val" style="color:var(--yellow)" value="0.0"
+                   onchange="onSliderInput('tau', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
         </div>
 
@@ -471,6 +499,19 @@
       <div class="card-title">Control Output</div>
       <div class="btn-row" style="flex-direction:column;gap:10px;">
         <button id="enable-btn" class="off" onclick="toggleEnable()">Enable Motor</button>
+        <button id="drag-btn" class="off" onclick="toggleDrag()">Drag Mode: OFF</button>
+        <div id="drag-limit-row" style="display:none;margin-top:2px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+            <span style="font-size:12px;font-weight:700;color:#f59e0b">Torque Limit (Nm)</span>
+            <span style="font-size:11px;color:var(--muted)" id="drag-limit-range">0.1 &hellip; 40</span>
+          </div>
+          <div class="slider-value-row">
+            <input type="range" id="drag-limit-slider" min="0.1" max="40" step="0.1"
+                   value="5" oninput="onDragTauLimit(this.value)"/>
+            <input class="slider-val-input" id="drag-limit-val" style="color:#f59e0b" value="5.0"
+                   onchange="onSliderInput('drag-limit', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
+          </div>
+        </div>
         <button id="estop-btn" onclick="triggerEstop()">&#9940; EMERGENCY STOP</button>
         <button id="clear-estop-btn" onclick="clearEstop()" style="display:none">Clear E-stop</button>
       </div>
@@ -483,62 +524,6 @@
     <div class="card" style="padding:14px 16px;">
       <div class="card-title">All Motor States &mdash; click a card to select joint</div>
       <div class="motor-grid" id="motor-grid"></div>
-    </div>
-
-    <!-- Live gauges for the selected motor -->
-    <div class="card">
-      <div class="card-title" id="gauges-title">Live Gauges &mdash; Motor 0</div>
-      <div class="gauge-grid">
-        <div class="gauge">
-          <div class="gauge-label">q actual</div>
-          <div class="gauge-value" id="g-q-act">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">q target</div>
-          <div class="gauge-value" id="g-q-tgt">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">q error</div>
-          <div class="gauge-value" id="g-q-err">&#x2014;</div>
-          <div class="gauge-unit">rad</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">velocity</div>
-          <div class="gauge-value" id="g-dq">&#x2014;</div>
-          <div class="gauge-unit">rad/s</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">&tau; est</div>
-          <div class="gauge-value" id="g-tau">&#x2014;</div>
-          <div class="gauge-unit">N&middot;m</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-label">temp</div>
-          <div class="gauge-value" id="g-temp">&#x2014;</div>
-          <div class="gauge-unit">&deg;C</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Signal-history charts for the selected motor -->
-    <div class="card">
-      <div class="card-title" id="charts-title">Signal History &mdash; Motor 0</div>
-      <div class="chart-block">
-        <div class="chart-row">
-          <div class="chart-label">Position (rad)</div>
-          <div class="chart-wrap"><canvas id="chart-q"></canvas></div>
-        </div>
-        <div class="chart-row">
-          <div class="chart-label">Velocity (rad/s)</div>
-          <div class="chart-wrap"><canvas id="chart-dq"></canvas></div>
-        </div>
-        <div class="chart-row">
-          <div class="chart-label">Torque est (N&middot;m)</div>
-          <div class="chart-wrap"><canvas id="chart-tau"></canvas></div>
-        </div>
-      </div>
     </div>
 
   </div>
@@ -653,9 +638,15 @@ let _selectedJoint = 0;
 let _enabled       = false;
 let _estop         = false;
 let _ctrlMotors    = [];
+let _actualMotors  = [];
 let _showExtended  = false;
 let _showSystem    = false;
-let _histQActual = [], _histQTarget = [], _histDq = [], _histTau = [];
+let _showPlots     = false;
+let _dragMode      = false;
+// Per-motor signal history (12 motors × 4 signals)
+let _histQ   = Array.from({length:12}, () => []);
+let _histDq  = Array.from({length:12}, () => []);
+let _histTau = Array.from({length:12}, () => []);
 
 // ============================================================
 // Build motor cards
@@ -685,7 +676,12 @@ function buildMotorCards() {
       '<div class="mc-row ext-row"><span class="lbl">q_raw</span>        <span class="val" id="mc-qraw-' + i + '">—</span></div>' +
       '<div class="mc-row ext-row"><span class="lbl">dq_raw</span>       <span class="val" id="mc-dqraw-' + i + '">—</span></div>' +
       '<div class="mc-row ext-row"><span class="lbl">ddq_raw</span>      <span class="val" id="mc-ddqraw-' + i + '">—</span></div>' +
-      '<div class="mc-row ext-row"><span class="lbl">Lost frames</span>  <span class="val" id="mc-lost-' + i + '">—</span></div>';
+      '<div class="mc-row ext-row"><span class="lbl">Lost frames</span>  <span class="val" id="mc-lost-' + i + '">—</span></div>' +
+      '<div class="mc-plots">' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">pos</span><div class="mc-plot-wrap"><canvas id="mc-chart-q-' + i + '"></canvas></div></div>' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">vel</span><div class="mc-plot-wrap"><canvas id="mc-chart-dq-' + i + '"></canvas></div></div>' +
+        '<div class="mc-plot-row"><span class="mc-plot-lbl">&tau;</span><div class="mc-plot-wrap"><canvas id="mc-chart-tau-' + i + '"></canvas></div></div>' +
+      '</div>';
     grid.appendChild(card);
   }
 }
@@ -705,26 +701,35 @@ function toggleSystem() {
   document.getElementById('toggle-sys-btn').classList.toggle('active', _showSystem);
 }
 
+function togglePlots() {
+  _showPlots = !_showPlots;
+  document.getElementById('motor-grid').classList.toggle('show-plots', _showPlots);
+  document.getElementById('toggle-plot-btn').classList.toggle('active', _showPlots);
+  if (_showPlots) drawAllCharts();
+}
+
 // ============================================================
 // Joint selection
 // ============================================================
+const ALL_JOINTS_Q_MIN = Math.min.apply(null, JOINT_LIMITS.map(function(l) { return l[0]; }));
+const ALL_JOINTS_Q_MAX = Math.max.apply(null, JOINT_LIMITS.map(function(l) { return l[1]; }));
+
 function selectJoint(idx) {
   _selectedJoint = idx;
   document.getElementById('joint-select').value = idx;
   updateSliderLimits(idx);
-  syncSlidersFromCtrl(idx);
+  if (idx >= 0) syncSlidersFromCtrl(idx);
   updateCardBorders();
-  // Clear signal history when switching joints
-  _histQActual.length = _histQTarget.length = _histDq.length = _histTau.length = 0;
-  drawAllCharts();
-  const title = 'Motor ' + idx + ' — ' + MOTOR_NAMES[idx];
-  document.getElementById('gauges-title').textContent  = 'Live Gauges — ' + title;
-  document.getElementById('charts-title').textContent  = 'Signal History — ' + title;
 }
 
 function updateSliderLimits(idx) {
-  const limits = JOINT_LIMITS[idx];
-  const lo = limits[0], hi = limits[1];
+  var lo, hi;
+  if (idx === -1) {
+    lo = ALL_JOINTS_Q_MIN; hi = ALL_JOINTS_Q_MAX;
+  } else {
+    const limits = JOINT_LIMITS[idx];
+    lo = limits[0]; hi = limits[1];
+  }
   const sl = document.getElementById('q-slider');
   sl.min = lo; sl.max = hi; sl.step = 0.01;
   document.getElementById('q-range-lbl').textContent =
@@ -732,31 +737,31 @@ function updateSliderLimits(idx) {
   let v = parseFloat(sl.value);
   v = Math.max(lo, Math.min(hi, v));
   sl.value = v;
-  document.getElementById('q-slider-val').textContent = v.toFixed(2);
+  document.getElementById('q-slider-val').value = v.toFixed(2);
 }
 
 function syncSlidersFromCtrl(idx) {
-  if (!_ctrlMotors[idx]) return;
+  if (idx < 0 || !_ctrlMotors[idx]) return;
   const c = _ctrlMotors[idx];
-  if (document.activeElement.id !== 'q-slider') {
+  if (document.activeElement.id !== 'q-slider' && document.activeElement.id !== 'q-slider-val') {
     document.getElementById('q-slider').value = c.q != null ? c.q : 0;
-    document.getElementById('q-slider-val').textContent = parseFloat(c.q != null ? c.q : 0).toFixed(2);
+    document.getElementById('q-slider-val').value = parseFloat(c.q != null ? c.q : 0).toFixed(2);
   }
-  if (document.activeElement.id !== 'dq-slider') {
+  if (document.activeElement.id !== 'dq-slider' && document.activeElement.id !== 'dq-slider-val') {
     document.getElementById('dq-slider').value = c.dq != null ? c.dq : 0;
-    document.getElementById('dq-slider-val').textContent = parseFloat(c.dq != null ? c.dq : 0).toFixed(1);
+    document.getElementById('dq-slider-val').value = parseFloat(c.dq != null ? c.dq : 0).toFixed(1);
   }
-  if (document.activeElement.id !== 'kp-slider') {
+  if (document.activeElement.id !== 'kp-slider' && document.activeElement.id !== 'kp-slider-val') {
     document.getElementById('kp-slider').value = c.kp != null ? c.kp : 60;
-    document.getElementById('kp-slider-val').textContent = parseFloat(c.kp != null ? c.kp : 60).toFixed(1);
+    document.getElementById('kp-slider-val').value = parseFloat(c.kp != null ? c.kp : 60).toFixed(1);
   }
-  if (document.activeElement.id !== 'kd-slider') {
+  if (document.activeElement.id !== 'kd-slider' && document.activeElement.id !== 'kd-slider-val') {
     document.getElementById('kd-slider').value = c.kd != null ? c.kd : 5;
-    document.getElementById('kd-slider-val').textContent = parseFloat(c.kd != null ? c.kd : 5).toFixed(2);
+    document.getElementById('kd-slider-val').value = parseFloat(c.kd != null ? c.kd : 5).toFixed(2);
   }
-  if (document.activeElement.id !== 'tau-slider') {
+  if (document.activeElement.id !== 'tau-slider' && document.activeElement.id !== 'tau-slider-val') {
     document.getElementById('tau-slider').value = c.tau != null ? c.tau : 0;
-    document.getElementById('tau-slider-val').textContent = parseFloat(c.tau != null ? c.tau : 0).toFixed(1);
+    document.getElementById('tau-slider-val').value = parseFloat(c.tau != null ? c.tau : 0).toFixed(1);
   }
 }
 
@@ -765,10 +770,12 @@ function updateCardBorders() {
     const card = document.getElementById('mc-' + i);
     if (!card) continue;
     const en = _ctrlMotors[i] && _ctrlMotors[i].enabled;
-    if (_estop)                    card.className = 'motor-card estopped';
-    else if (i === _selectedJoint) card.className = 'motor-card selected' + (en ? ' enabled' : '');
-    else if (en)                   card.className = 'motor-card enabled';
-    else                           card.className = 'motor-card';
+    const sel = (_selectedJoint === -1 || i === _selectedJoint);
+    if (_estop)        card.className = 'motor-card estopped';
+    else if (sel && en) card.className = 'motor-card selected enabled';
+    else if (sel)       card.className = 'motor-card selected';
+    else if (en)        card.className = 'motor-card enabled';
+    else                card.className = 'motor-card';
   }
 }
 
@@ -796,10 +803,15 @@ function onStatus(s) {
   const ctrl = s.control || {};
   _estop = ctrl.estop || false;
   _ctrlMotors = ctrl.motors || _ctrlMotors;
-  _enabled = (_ctrlMotors[_selectedJoint] || {}).enabled || false;
+  if (_selectedJoint === -1) {
+    _enabled = _ctrlMotors.some(function(m) { return m && m.enabled; });
+  } else {
+    _enabled = (_ctrlMotors[_selectedJoint] || {}).enabled || false;
+  }
 
   // Motor cards
   const motors = s.motors || [];
+  _actualMotors = motors;
   for (let i = 0; i < motors.length; i++) {
     const m = motors[i];
     const tc = m.temperature >= 70 ? 'hot' : m.temperature >= 50 ? 'warm' : 'normal';
@@ -820,12 +832,42 @@ function onStatus(s) {
   updateCardBorders();
 
   // Sync sliders for selected joint
-  syncSlidersFromCtrl(_selectedJoint);
+  if (_selectedJoint >= 0) syncSlidersFromCtrl(_selectedJoint);
+  // In all-joints mode, don't auto-sync (values may differ per joint)
 
   // Enable button
   const ebtn = document.getElementById('enable-btn');
-  ebtn.textContent = _enabled ? 'Disable Motor' : 'Enable Motor';
-  ebtn.className   = _enabled ? 'on' : 'off';
+  if (_selectedJoint === -1) {
+    const anyOn = _ctrlMotors.some(function(m) { return m && m.enabled; });
+    ebtn.textContent = anyOn ? 'Disable All Motors' : 'Enable All Motors';
+    ebtn.className   = anyOn ? 'on' : 'off';
+  } else {
+    ebtn.textContent = _enabled ? 'Disable Motor' : 'Enable Motor';
+    ebtn.className   = _enabled ? 'on' : 'off';
+  }
+
+  // Drag mode button
+  const dbtn = document.getElementById('drag-btn');
+  const dlRow = document.getElementById('drag-limit-row');
+  if (_selectedJoint === -1) {
+    const anyDrag = _ctrlMotors.some(function(m) { return m && m.drag; });
+    _dragMode = anyDrag;
+    dbtn.textContent = anyDrag ? 'Drag Mode: ON' : 'Drag Mode: OFF';
+    dbtn.className   = anyDrag ? 'on' : 'off';
+    dlRow.style.display = anyDrag ? '' : 'none';
+  } else {
+    const dm = (_ctrlMotors[_selectedJoint] || {}).drag || false;
+    _dragMode = dm;
+    dbtn.textContent = dm ? 'Drag Mode: ON' : 'Drag Mode: OFF';
+    dbtn.className   = dm ? 'on' : 'off';
+    dlRow.style.display = dm ? '' : 'none';
+    // Sync tau_limit slider
+    const dtl = (_ctrlMotors[_selectedJoint] || {}).drag_tau_limit;
+    if (dtl != null && document.activeElement.id !== 'drag-limit-slider' && document.activeElement.id !== 'drag-limit-val') {
+      document.getElementById('drag-limit-slider').value = dtl;
+      document.getElementById('drag-limit-val').value = parseFloat(dtl).toFixed(1);
+    }
+  }
 
   // E-stop buttons
   document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
@@ -873,12 +915,16 @@ function onStatus(s) {
   setGauge('g-tau',  selMot.tau_est != null ? selMot.tau_est : null, 3);
   setGauge('g-temp', selMot.temperature != null ? selMot.temperature : null, 1);
 
-  // Signal history
-  if (qAct != null) { _histQActual.push(qAct);  if (_histQActual.length > CHART_HISTORY) _histQActual.shift(); }
-  if (qTgt != null) { _histQTarget.push(qTgt);  if (_histQTarget.length > CHART_HISTORY) _histQTarget.shift(); }
-  if (selMot.dq != null)      { _histDq.push(selMot.dq);       if (_histDq.length  > CHART_HISTORY) _histDq.shift(); }
-  if (selMot.tau_est != null) { _histTau.push(selMot.tau_est); if (_histTau.length > CHART_HISTORY) _histTau.shift(); }
-  drawAllCharts();
+  // Per-motor signal history (all 12)
+  const allMotors = s.motors || [];
+  for (let i = 0; i < 12; i++) {
+    const m = allMotors[i];
+    if (!m) continue;
+    if (m.q       != null) { _histQ[i].push(m.q);       if (_histQ[i].length   > CHART_HISTORY) _histQ[i].shift(); }
+    if (m.dq      != null) { _histDq[i].push(m.dq);     if (_histDq[i].length  > CHART_HISTORY) _histDq[i].shift(); }
+    if (m.tau_est != null) { _histTau[i].push(m.tau_est); if (_histTau[i].length > CHART_HISTORY) _histTau[i].shift(); }
+  }
+  if (_showPlots) drawAllCharts();
 
   const selQ   = (s.motors || [])[_selectedJoint];
   const ctrlQ  = (_ctrlMotors[_selectedJoint] || {});
@@ -966,7 +1012,7 @@ function updatePower(d) {
 
 function updateBMS(bms) {
   setVal('bms-soc',  bms.soc     != null ? bms.soc + ' %'              : '—');
-  setVal('bms-cur',  bms.current != null ? bms.current.toFixed(2) + ' A' : '—');
+  setVal('bms-cur',  bms.current != null ? (bms.current / 1000).toFixed(2) + ' A' : '—');
   setVal('bms-cyc',  bms.cycle   != null ? bms.cycle   : '—');
   setVal('bms-sta',  bms.status  != null ? '0x' + bms.status.toString(16).toUpperCase() : '—');
   setVal('bms-ver',  bms.version != null ? bms.version : '—');
@@ -1042,36 +1088,115 @@ function toggleService(name) {
 // Slider handlers
 // ============================================================
 function onQSlider(val) {
-  document.getElementById('q-slider-val').textContent = parseFloat(val).toFixed(2);
+  document.getElementById('q-slider-val').value = parseFloat(val).toFixed(2);
   if (_enabled) sendCmd({ q: parseFloat(val) });
 }
 function onDqSlider(val) {
-  document.getElementById('dq-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('dq-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ dq: parseFloat(val) });
 }
 function onKpSlider(val) {
-  document.getElementById('kp-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('kp-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ kp: parseFloat(val) });
 }
 function onKdSlider(val) {
-  document.getElementById('kd-slider-val').textContent = parseFloat(val).toFixed(2);
+  document.getElementById('kd-slider-val').value = parseFloat(val).toFixed(2);
   if (_enabled) sendCmd({ kd: parseFloat(val) });
 }
 function onTauSlider(val) {
-  document.getElementById('tau-slider-val').textContent = parseFloat(val).toFixed(1);
+  document.getElementById('tau-slider-val').value = parseFloat(val).toFixed(1);
   if (_enabled) sendCmd({ tau: parseFloat(val) });
 }
 
+// Set q slider to current actual position
+function setCurrentQ() {
+  if (_selectedJoint === -1) {
+    // All-joints mode: set each joint's q to its own current position
+    for (let i = 0; i < 12; i++) {
+      const m = _actualMotors[i];
+      if (m && m.q != null) {
+        const c = _ctrlMotors[i] || {};
+        post('/api/cmd', {
+          motor_idx: i,
+          enabled:   c.enabled || false,
+          q:   m.q,
+          dq:  c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value),
+          kp:  c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value),
+          kd:  c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value),
+          tau: c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value),
+        });
+      }
+    }
+  } else {
+    const m = _actualMotors[_selectedJoint];
+    if (m && m.q != null) {
+      const sl = document.getElementById('q-slider');
+      const v = Math.max(parseFloat(sl.min), Math.min(parseFloat(sl.max), m.q));
+      sl.value = v;
+      document.getElementById('q-slider-val').value = v.toFixed(2);
+      const c = _ctrlMotors[_selectedJoint] || {};
+      post('/api/cmd', {
+        motor_idx: _selectedJoint,
+        enabled:   c.enabled || false,
+        q:   v,
+        dq:  c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value),
+        kp:  c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value),
+        kd:  c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value),
+        tau: c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value),
+      });
+    }
+  }
+}
+
+// Direct-input handler: user typed a value in the editable field
+function onSliderInput(param, raw) {
+  var v = parseFloat(raw);
+  if (isNaN(v)) return;
+  var slider = document.getElementById(param + '-slider');
+  v = Math.max(parseFloat(slider.min), Math.min(parseFloat(slider.max), v));
+  slider.value = v;
+  // Format the display based on param
+  var fmt = (param === 'q') ? v.toFixed(2) :
+            (param === 'kd') ? v.toFixed(2) :
+            v.toFixed(1);
+  document.getElementById(param + '-slider-val').value = fmt;
+  // Drag-limit goes to the drag API, not sendCmd
+  if (param === 'drag-limit') {
+    onDragTauLimit(v);
+    return;
+  }
+  if (_enabled) {
+    var obj = {}; obj[param] = v;
+    sendCmd(obj);
+  }
+}
+
 function sendCmd(overrides) {
-  post('/api/cmd', {
-    motor_idx: _selectedJoint,
-    enabled:   true,
-    q:   overrides.q   != null ? overrides.q   : parseFloat(document.getElementById('q-slider').value),
-    dq:  overrides.dq  != null ? overrides.dq  : parseFloat(document.getElementById('dq-slider').value),
-    kp:  overrides.kp  != null ? overrides.kp  : parseFloat(document.getElementById('kp-slider').value),
-    kd:  overrides.kd  != null ? overrides.kd  : parseFloat(document.getElementById('kd-slider').value),
-    tau: overrides.tau != null ? overrides.tau : parseFloat(document.getElementById('tau-slider').value),
-  });
+  if (_selectedJoint === -1) {
+    // All-joints mode: send override to every joint, keeping each joint's own values for untouched params
+    for (let i = 0; i < 12; i++) {
+      const c = _ctrlMotors[i] || {};
+      post('/api/cmd', {
+        motor_idx: i,
+        enabled:   true,
+        q:   overrides.q   != null ? overrides.q   : (c.q   != null ? c.q   : parseFloat(document.getElementById('q-slider').value)),
+        dq:  overrides.dq  != null ? overrides.dq  : (c.dq  != null ? c.dq  : parseFloat(document.getElementById('dq-slider').value)),
+        kp:  overrides.kp  != null ? overrides.kp  : (c.kp  != null ? c.kp  : parseFloat(document.getElementById('kp-slider').value)),
+        kd:  overrides.kd  != null ? overrides.kd  : (c.kd  != null ? c.kd  : parseFloat(document.getElementById('kd-slider').value)),
+        tau: overrides.tau != null ? overrides.tau : (c.tau != null ? c.tau : parseFloat(document.getElementById('tau-slider').value)),
+      });
+    }
+  } else {
+    post('/api/cmd', {
+      motor_idx: _selectedJoint,
+      enabled:   true,
+      q:   overrides.q   != null ? overrides.q   : parseFloat(document.getElementById('q-slider').value),
+      dq:  overrides.dq  != null ? overrides.dq  : parseFloat(document.getElementById('dq-slider').value),
+      kp:  overrides.kp  != null ? overrides.kp  : parseFloat(document.getElementById('kp-slider').value),
+      kd:  overrides.kd  != null ? overrides.kd  : parseFloat(document.getElementById('kd-slider').value),
+      tau: overrides.tau != null ? overrides.tau : parseFloat(document.getElementById('tau-slider').value),
+    });
+  }
 }
 
 // ============================================================
@@ -1079,10 +1204,60 @@ function sendCmd(overrides) {
 // ============================================================
 function toggleEnable() {
   if (_estop) return;
-  if (_enabled) {
+  if (_selectedJoint === -1) {
+    // All-joints mode
+    const anyOn = _ctrlMotors.some(function(m) { return m && m.enabled; });
+    if (anyOn) {
+      for (let i = 0; i < 12; i++) {
+        post('/api/cmd', { motor_idx: i, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
+      }
+    } else {
+      // Enable all joints — set each joint's q to its current actual position
+      for (let i = 0; i < 12; i++) {
+        const m = _actualMotors[i] || {};
+        const q = (m.q != null) ? m.q : 0;
+        post('/api/cmd', {
+          motor_idx: i,
+          enabled:   true,
+          q:   q,
+          dq:  parseFloat(document.getElementById('dq-slider').value),
+          kp:  parseFloat(document.getElementById('kp-slider').value),
+          kd:  parseFloat(document.getElementById('kd-slider').value),
+          tau: parseFloat(document.getElementById('tau-slider').value),
+        });
+      }
+    }
+  } else if (_enabled) {
     post('/api/cmd', { motor_idx: _selectedJoint, enabled: false, q: 0, dq: 0, tau: 0, kp: 0, kd: 5 });
   } else {
     sendCmd({});
+  }
+}
+
+function toggleDrag() {
+  if (_selectedJoint === -1) {
+    // All-joints mode: toggle drag for all 12
+    var newState = !_dragMode;
+    var lim = parseFloat(document.getElementById('drag-limit-slider').value);
+    for (let i = 0; i < 12; i++) {
+      post('/api/drag', { motor_idx: i, enabled: newState, tau_limit: lim });
+    }
+  } else {
+    var cur = (_ctrlMotors[_selectedJoint] || {}).drag || false;
+    var lim = parseFloat(document.getElementById('drag-limit-slider').value);
+    post('/api/drag', { motor_idx: _selectedJoint, enabled: !cur, tau_limit: lim });
+  }
+}
+
+function onDragTauLimit(val) {
+  val = parseFloat(val);
+  document.getElementById('drag-limit-val').value = val.toFixed(1);
+  if (_selectedJoint === -1) {
+    for (let i = 0; i < 12; i++) {
+      post('/api/drag', { motor_idx: i, enabled: true, tau_limit: val });
+    }
+  } else {
+    post('/api/drag', { motor_idx: _selectedJoint, enabled: true, tau_limit: val });
   }
 }
 
@@ -1117,7 +1292,7 @@ function setGauge(id, val, decimals) {
 }
 
 // ============================================================
-// Signal-history charts
+// Signal-history charts (all 12 motors)
 // ============================================================
 function _autoRange(data, minSpan) {
   if (!data.length) return [-1, 1];
@@ -1128,68 +1303,58 @@ function _autoRange(data, minSpan) {
   return [lo - pad, hi + pad];
 }
 
-function drawOneChart(id, series, yMin, yMax, gridVals) {
-  const canvas = document.getElementById(id);
+function drawCanvas(canvas, series, yMin, yMax, color) {
   if (!canvas) return;
-  const W = canvas.clientWidth  || 400;
-  const H = canvas.clientHeight || 110;
+  const W = canvas.clientWidth  || 200;
+  const H = canvas.clientHeight || 40;
   if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#0f1117';
   ctx.fillRect(0, 0, W, H);
-  const PAD_L = 42, PAD_R = 6, PAD_T = 6, PAD_B = 6;
-  const PW = W - PAD_L - PAD_R;
-  const PH = H - PAD_T - PAD_B;
+  const PAD_L = 4, PAD_R = 44, PAD_T = 3, PAD_B = 3;
+  const PW = W - PAD_L - PAD_R, PH = H - PAD_T - PAD_B;
   const range = yMax - yMin || 1;
-  function toX(i, total) { return PAD_L + (total <= 1 ? PW/2 : i / (total - 1) * PW); }
-  function toY(v)         { return PAD_T + PH * (1 - (v - yMin) / range); }
-  // Grid lines
-  if (gridVals) {
+  function toY(v) { return PAD_T + PH * (1 - (v - yMin) / range); }
+  // Zero line
+  if (yMin <= 0 && yMax >= 0) {
+    const zy = toY(0);
     ctx.strokeStyle = '#21252f'; ctx.lineWidth = 1;
-    ctx.fillStyle   = '#5a6070'; ctx.font = '9px monospace'; ctx.textAlign = 'right';
-    for (let g of gridVals) {
-      const gy = Math.round(toY(g)) + 0.5;
-      ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(W - PAD_R, gy); ctx.stroke();
-      ctx.fillText(g.toFixed(2), PAD_L - 3, gy + 3);
-    }
+    ctx.beginPath(); ctx.moveTo(PAD_L, zy); ctx.lineTo(W - PAD_R, zy); ctx.stroke();
   }
-  // Data series
-  const COLORS = ['#4f8ef7', '#3ecf6e'];
-  for (let s = 0; s < series.length; s++) {
-    const data = series[s];
-    if (!data.length) continue;
-    ctx.strokeStyle = COLORS[s % COLORS.length]; ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (let i = 0; i < data.length; i++) {
-      const x = toX(i, data.length), y = toY(data[i]);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+  // Y-axis labels (min / max) on the right
+  ctx.font = '8px monospace'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#5a6070';
+  ctx.fillText(yMax.toFixed(1), W - PAD_R + 3, PAD_T + 6);
+  ctx.fillText(yMin.toFixed(1), W - PAD_R + 3, H - PAD_B);
+  // Data line
+  if (!series.length) return;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = PAD_L + (series.length <= 1 ? PW / 2 : i / (series.length - 1) * PW);
+    const y = toY(series[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
+  ctx.stroke();
+  // Current value label (latest point)
+  const cur = series[series.length - 1];
+  const cy  = toY(cur);
+  ctx.fillStyle = color; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(cur.toFixed(2), W - PAD_R + 3, Math.max(PAD_T + 16, Math.min(H - PAD_B - 8, cy + 3)));
 }
 
 function drawAllCharts() {
-  const limits = JOINT_LIMITS[_selectedJoint];
-  const qGrids = [
-    parseFloat(limits[0].toFixed(2)), 0,
-    parseFloat(limits[1].toFixed(2))
-  ].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
-  drawOneChart('chart-q',
-    [_histQActual, _histQTarget],
-    limits[0], limits[1], qGrids);
-
-  const dqR   = _autoRange(_histDq, 0.5);
-  const dqGrid = [parseFloat(dqR[0].toFixed(2)), 0, parseFloat(dqR[1].toFixed(2))]
-    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
-  drawOneChart('chart-dq',  [_histDq],  dqR[0],  dqR[1],  dqGrid);
-
-  const tauR  = _autoRange(_histTau, 1.0);
-  const tauGrid = [parseFloat(tauR[0].toFixed(2)), 0, parseFloat(tauR[1].toFixed(2))]
-    .filter((v,i,a)=>a.indexOf(v)===i).sort((a,b)=>a-b);
-  drawOneChart('chart-tau', [_histTau], tauR[0], tauR[1], tauGrid);
+  for (let i = 0; i < 12; i++) {
+    const qR   = _autoRange(_histQ[i],   0.05);
+    drawCanvas(document.getElementById('mc-chart-q-'   + i), _histQ[i],   qR[0],  qR[1],  LEG_COLORS[i]);
+    const dqR  = _autoRange(_histDq[i],  0.5);
+    drawCanvas(document.getElementById('mc-chart-dq-'  + i), _histDq[i],  dqR[0], dqR[1], '#a78bfa');
+    const tauR = _autoRange(_histTau[i], 1.0);
+    drawCanvas(document.getElementById('mc-chart-tau-' + i), _histTau[i], tauR[0], tauR[1], '#f0c050');
+  }
 }
 
-window.addEventListener('resize', drawAllCharts);
+window.addEventListener('resize', function() { if (_showPlots) drawAllCharts(); });
 
 // ============================================================
 // Fetch helper
@@ -1207,12 +1372,18 @@ function post(url, body) {
 // ============================================================
 (function init() {
   const sel = document.getElementById('joint-select');
+  // "All Joints" option
+  const allOpt = document.createElement('option');
+  allOpt.value = -1;
+  allOpt.textContent = 'All Joints';
+  sel.appendChild(allOpt);
   for (let i = 0; i < 12; i++) {
     const o = document.createElement('option');
     o.value = i;
     o.textContent = i + ': ' + MOTOR_NAMES[i];
     sel.appendChild(o);
   }
+  sel.value = 0;
   buildMotorCards();
   updateSliderLimits(0);
   buildBmsCells(15);

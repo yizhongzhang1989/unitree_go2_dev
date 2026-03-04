@@ -90,6 +90,11 @@ class DragRequest(BaseModel):
     tau_limit: float | None = None   # Nm; if omitted keeps current limit
 
 
+class DirectTorqueRequest(BaseModel):
+    motor_idx: int          # 0–11
+    enabled:   bool
+
+
 # ---------------------------------------------------------------------------
 # WebSocket manager
 # ---------------------------------------------------------------------------
@@ -199,6 +204,17 @@ async def api_drag(req: DragRequest) -> JSONResponse:
         return JSONResponse({'error': 'not ready'}, status_code=503)
     try:
         _status_capture.set_drag(req.motor_idx, req.enabled, req.tau_limit)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/direct_torque', response_class=JSONResponse)
+async def api_direct_torque(req: DirectTorqueRequest) -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    try:
+        _status_capture.set_direct_torque(req.motor_idx, req.enabled)
     except ValueError as e:
         return JSONResponse({'error': str(e)}, status_code=400)
     return JSONResponse({'ok': True})

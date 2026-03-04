@@ -500,6 +500,10 @@
             <input class="slider-val-input" id="tau-slider-val" style="color:var(--yellow)" value="0.0"
                    onchange="onSliderInput('tau', this.value)" onkeydown="if(event.key==='Enter')this.blur()"/>
           </div>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:12px;color:var(--yellow);cursor:pointer;user-select:none">
+            <input type="checkbox" id="direct-torque-cb" onchange="toggleDirectTorque(this.checked)"/>
+            Direct Torque Mode <span style="font-size:11px;color:var(--muted)">&tau;<sub>cmd</sub> = &tau; + Kp&middot;(q<sub>des</sub>&minus;q) + Kd&middot;(dq<sub>des</sub>&minus;dq)</span>
+          </label>
         </div>
 
       </div>
@@ -692,6 +696,7 @@ let _showPlots     = false;
 let _dragMode      = false;
 let _isRecording   = false;
 let _recordFrames  = 0;
+let _directTorque  = false;
 let _isPlaying     = false;
 let _playbackLoaded = false;
 // Per-motor signal history (12 motors × 4 signals)
@@ -814,6 +819,10 @@ function syncSlidersFromCtrl(idx) {
     document.getElementById('tau-slider').value = c.tau != null ? c.tau : 0;
     document.getElementById('tau-slider-val').value = parseFloat(c.tau != null ? c.tau : 0).toFixed(1);
   }
+  // Direct torque checkbox
+  var dt = c.direct_torque || false;
+  document.getElementById('direct-torque-cb').checked = dt;
+  _directTorque = dt;
 }
 
 function updateCardBorders() {
@@ -906,6 +915,10 @@ function onStatus(s) {
     dbtn.textContent = anyDrag ? 'Drag Mode: ON' : 'Drag Mode: OFF';
     dbtn.className   = anyDrag ? 'on' : 'off';
     dlRow.style.display = anyDrag ? '' : 'none';
+    // Direct torque: show if any motor has it on
+    const anyDT = _ctrlMotors.some(function(m) { return m && m.direct_torque; });
+    _directTorque = anyDT;
+    document.getElementById('direct-torque-cb').checked = anyDT;
   } else {
     const dm = (_ctrlMotors[_selectedJoint] || {}).drag || false;
     _dragMode = dm;
@@ -1346,6 +1359,16 @@ function toggleDrag() {
     var cur = (_ctrlMotors[_selectedJoint] || {}).drag || false;
     var lim = parseFloat(document.getElementById('drag-limit-slider').value);
     post('/api/drag', { motor_idx: _selectedJoint, enabled: !cur, tau_limit: lim });
+  }
+}
+
+function toggleDirectTorque(checked) {
+  if (_selectedJoint === -1) {
+    for (let i = 0; i < 12; i++) {
+      post('/api/direct_torque', { motor_idx: i, enabled: checked });
+    }
+  } else {
+    post('/api/direct_torque', { motor_idx: _selectedJoint, enabled: checked });
   }
 }
 

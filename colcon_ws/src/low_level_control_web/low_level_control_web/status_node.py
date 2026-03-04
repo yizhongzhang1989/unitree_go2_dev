@@ -100,6 +100,8 @@ class ControlNode(Node):
         # When drag is enabled for a motor, if |tau_est| > tau_limit the
         # position target is updated to the actual position so the joint yields.
         self._drag_enabled: list[bool] = [False] * 12
+        # Direct-torque mode: when enabled, kp=0 kd=0 so tau_ff is the sole input.
+        self._direct_torque: list[bool] = [False] * 12
         # Default torque limits per joint type (Nm).
         # Go2 hip=~23.7 Nm, thigh/calf=~45.43 Nm peak; use conservative defaults.
         self._drag_tau_limit: list[float] = [
@@ -164,6 +166,7 @@ class ControlNode(Node):
             cmds  = [dict(c) for c in self._motor_cmds]
             drag_en = list(self._drag_enabled)
             drag_lim = list(self._drag_tau_limit)
+            dtorque = list(self._direct_torque)
             status = self._latest_status
             # Playback: interpolate q and dq by elapsed time
             pb_active = self._playback_active
@@ -205,13 +208,32 @@ class ControlNode(Node):
                 c      = cmds[i]
                 kp_val = float(c['kp'])
                 kd_val = float(c['kd'])
-                # Sentinel: tell firmware to ignore position/velocity when
-                # the corresponding gain is zero (prevents residual damping).
-                mc.q   = POS_STOP_F if kp_val < 0.01 else float(c['q'])
-                mc.dq  = VEL_STOP_F if kd_val < 0.01 else float(c['dq'])
-                mc.tau = float(c['tau'])
-                mc.kp  = kp_val
-                mc.kd  = kd_val
+                tau_val = float(c['tau'])
+                # Direct-torque mode: compute tau explicitly on our side
+                # τ_cmd = τ_ff + Kp·(q_des − q_act) + Kd·(dq_des − dq_act)
+                # then send with kp=0, kd=0 so firmware applies τ_cmd directly.
+                if dtorque[i]:
+                    q_act  = 0.0
+                    dq_act = 0.0
+                    if status is not None:
+                        mfb = status.get('motors', [])
+                        if i < len(mfb):
+                            q_act  = float(mfb[i].get('q', 0.0))
+                            dq_act = float(mfb[i].get('dq', 0.0))
+                    tau_val = tau_val + kp_val * (float(c['q']) - q_act) + kd_val * (float(c['dq']) - dq_act)
+                    mc.q   = POS_STOP_F
+                    mc.dq  = VEL_STOP_F
+                    mc.tau = tau_val
+                    mc.kp  = 0.0
+                    mc.kd  = 0.0
+                else:
+                    # Sentinel: tell firmware to ignore position/velocity when
+                    # the corresponding gain is zero (prevents residual damping).
+                    mc.q   = POS_STOP_F if kp_val < 0.01 else float(c['q'])
+                    mc.dq  = VEL_STOP_F if kd_val < 0.01 else float(c['dq'])
+                    mc.tau = tau_val
+                    mc.kp  = kp_val
+                    mc.kd  = kd_val
             elif i < 12 and estop:
                 mc.q   = POS_STOP_F
                 mc.dq  = VEL_STOP_F
@@ -262,7 +284,8 @@ class ControlNode(Node):
                 'motors': [
                     {**dict(c), 'q_des': self._q_des[i],
                      'drag': self._drag_enabled[i],
-                     'drag_tau_limit': self._drag_tau_limit[i]}
+                     'drag_tau_limit': self._drag_tau_limit[i],
+                     'direct_torque': self._direct_torque[i]}
                     for i, c in enumerate(self._motor_cmds)
                 ],
                 'playback': {
@@ -475,6 +498,17 @@ class ControlNode(Node):
                 any_enabled = any(c['enabled'] for c in self._motor_cmds)
                 if not any_enabled and not self._estop:
                     self._publishing_active = False
+
+    def set_direct_torque(self, idx: int, enabled: bool) -> None:
+        """Enable/disable direct-torque mode for motor *idx*.
+
+        When active, kp and kd are forced to 0 so that only tau_ff
+        drives the motor.
+        """
+        if not (0 <= idx <= 11):
+            raise ValueError(f'Motor index {idx} out of range 0-11')
+        with self._lock:
+            self._direct_torque[idx] = bool(enabled)
 
     def set_drag(self, idx: int, enabled: bool, tau_limit: float | None = None) -> None:
         """Enable/disable drag (torque-limited compliance) for motor *idx*.

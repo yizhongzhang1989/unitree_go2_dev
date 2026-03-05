@@ -1,8 +1,8 @@
 """recorder.py — Subscribe to rt/lowcmd and rt/lowstate via Unitree SDK2 DDS.
 
-Runs two background threads that continuously read the latest LowCmd and
-LowState messages.  When recording is active, each tick appends a timestamped
-row combining both command and state data.
+Uses callback-based subscription so every message is captured at the full
+publish rate (~500 Hz).  When recording is active, each rt/lowstate callback
+appends a timestamped row combining the state with the latest command.
 """
 
 import csv
@@ -44,37 +44,27 @@ class Recorder:
         # Initialise Unitree SDK2 DDS channel
         ChannelFactoryInitialize(0, network_interface)
 
-        # Subscribe to rt/lowcmd
+        # Subscribe to rt/lowcmd — callback caches latest command
         self._cmd_sub = ChannelSubscriber('rt/lowcmd', LowCmd_)
-        self._cmd_sub.Init()
+        self._cmd_sub.Init(handler=self._on_cmd)
 
-        # Subscribe to rt/lowstate
+        # Subscribe to rt/lowstate — callback drives recording at full rate
         self._state_sub = ChannelSubscriber('rt/lowstate', LowState_)
-        self._state_sub.Init()
-
-        # Poller thread — reads both channels at ~250 Hz
-        self._stop = threading.Event()
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name='dds_poll'
-        )
-        self._poll_thread.start()
+        self._state_sub.Init(handler=self._on_state)
 
     # ------------------------------------------------------------------
-    # Background poller
+    # DDS callbacks (called from SDK threads at ~500 Hz each)
     # ------------------------------------------------------------------
 
-    def _poll_loop(self) -> None:
-        while not self._stop.is_set():
-            cmd = self._cmd_sub.Read()
-            state = self._state_sub.Read()
-            with self._lock:
-                if cmd is not None:
-                    self._latest_cmd = cmd
-                if state is not None:
-                    self._latest_state = state
-                if self._recording and (self._latest_cmd is not None or self._latest_state is not None):
-                    self._record_frame()
-            _time.sleep(0.004)  # ~250 Hz
+    def _on_cmd(self, msg: object) -> None:
+        with self._lock:
+            self._latest_cmd = msg
+
+    def _on_state(self, msg: object) -> None:
+        with self._lock:
+            self._latest_state = msg
+            if self._recording:
+                self._record_frame()
 
     def _record_frame(self) -> None:
         """Append one row combining cmd + state. Must hold self._lock."""
@@ -210,4 +200,5 @@ class Recorder:
             }
 
     def shutdown(self) -> None:
-        self._stop.set()
+        self._cmd_sub.Close()
+        self._state_sub.Close()

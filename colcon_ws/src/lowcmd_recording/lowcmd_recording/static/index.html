@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>LowCmd Recording</title>
+<style>
+  :root {
+    --bg: #0e1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --red: #f85149; --green: #3fb950; --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 20px;
+  }
+  h1 { font-size: 22px; margin-bottom: 16px; }
+  .status-bar {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 16px; font-size: 13px; color: var(--muted);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); }
+  .dot.live { background: var(--green); }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  }
+  .card-title { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    padding: 10px 18px; border: none; border-radius: 6px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit;
+  }
+  #rec-btn.idle      { background: #2e3147; color: var(--text); }
+  #rec-btn.recording { background: var(--red); color: #fff; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
+  #dl-btn { background: #2e3147; color: var(--text); }
+  #dl-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .info { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
+  td:first-child, th:first-child { text-align: left; }
+  .cmd-col { color: var(--yellow); }
+  .state-col { color: var(--accent); }
+  .table-wrap { max-height: 480px; overflow-y: auto; }
+</style>
+</head>
+<body>
+
+<h1>LowCmd &amp; LowState Recording</h1>
+
+<div class="status-bar">
+  <span class="dot" id="conn-dot"></span>
+  <span id="conn-txt">Connecting…</span>
+</div>
+
+<!-- Recording controls -->
+<div class="card">
+  <div class="card-title">Recording</div>
+  <div class="btn-row">
+    <button id="rec-btn" class="idle" onclick="toggleRecord()">&#9210; Start Recording</button>
+    <button id="dl-btn" onclick="download()" disabled>&#11015; Download CSV</button>
+  </div>
+  <div class="info" id="rec-info" style="display:none"></div>
+</div>
+
+<!-- Live motor table -->
+<div class="card">
+  <div class="card-title">Live Motor Data</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Motor</th>
+          <th class="cmd-col">cmd q</th>
+          <th class="cmd-col">cmd dq</th>
+          <th class="cmd-col">cmd &tau;</th>
+          <th class="cmd-col">Kp</th>
+          <th class="cmd-col">Kd</th>
+          <th class="state-col">q</th>
+          <th class="state-col">dq</th>
+          <th class="state-col">&tau;_est</th>
+          <th class="state-col">T&deg;C</th>
+        </tr>
+      </thead>
+      <tbody id="motor-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+var _isRecording = false;
+var _frames = 0;
+
+// Build table rows
+(function() {
+  var names = [
+    'FR_0','FR_1','FR_2',
+    'FL_0','FL_1','FL_2',
+    'RR_0','RR_1','RR_2',
+    'RL_0','RL_1','RL_2',
+  ];
+  var tb = document.getElementById('motor-tbody');
+  for (var i = 0; i < 12; i++) {
+    var tr = document.createElement('tr');
+    tr.id = 'mrow-' + i;
+    tr.innerHTML = '<td>' + names[i] + '</td>'
+      + '<td class="cmd-col" id="cq-'+i+'">—</td>'
+      + '<td class="cmd-col" id="cdq-'+i+'">—</td>'
+      + '<td class="cmd-col" id="ctau-'+i+'">—</td>'
+      + '<td class="cmd-col" id="ckp-'+i+'">—</td>'
+      + '<td class="cmd-col" id="ckd-'+i+'">—</td>'
+      + '<td class="state-col" id="sq-'+i+'">—</td>'
+      + '<td class="state-col" id="sdq-'+i+'">—</td>'
+      + '<td class="state-col" id="stau-'+i+'">—</td>'
+      + '<td class="state-col" id="stemp-'+i+'">—</td>';
+    tb.appendChild(tr);
+  }
+})();
+
+function setV(id, v, dec) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = v != null ? parseFloat(v).toFixed(dec) : '—';
+}
+
+// WebSocket
+function connect() {
+  var ws = new WebSocket('ws://' + location.host + '/ws');
+  var dot = document.getElementById('conn-dot');
+  var txt = document.getElementById('conn-txt');
+  ws.onopen = function() { dot.classList.add('live'); txt.textContent = 'Connected'; };
+  ws.onmessage = function(e) {
+    try { onData(JSON.parse(e.data)); } catch(ex) {}
+  };
+  ws.onclose = function() {
+    dot.classList.remove('live');
+    txt.textContent = 'Reconnecting…';
+    setTimeout(connect, 1500);
+  };
+}
+connect();
+
+function onData(s) {
+  var motors = s.motors || [];
+  for (var i = 0; i < motors.length; i++) {
+    var m = motors[i];
+    setV('cq-'+i,   m.cmd_q,   4);
+    setV('cdq-'+i,  m.cmd_dq,  4);
+    setV('ctau-'+i, m.cmd_tau, 4);
+    setV('ckp-'+i,  m.cmd_kp,  2);
+    setV('ckd-'+i,  m.cmd_kd,  2);
+    setV('sq-'+i,   m.q,       4);
+    setV('sdq-'+i,  m.dq,      4);
+    setV('stau-'+i, m.tau_est, 4);
+    setV('stemp-'+i, m.temp,   0);
+  }
+
+  // Recording state
+  var rec = s.recording || {};
+  _isRecording = rec.recording || false;
+  _frames = rec.frames || 0;
+  var btn = document.getElementById('rec-btn');
+  var info = document.getElementById('rec-info');
+  var dl = document.getElementById('dl-btn');
+  if (_isRecording) {
+    btn.innerHTML = '&#9209; Stop Recording';
+    btn.className = 'recording';
+    info.style.display = '';
+    info.textContent = 'Recording: ' + _frames + ' frames, ' + (rec.duration || 0).toFixed(1) + 's';
+    dl.disabled = true;
+  } else {
+    btn.innerHTML = '&#9210; Start Recording';
+    btn.className = 'idle';
+    if (_frames > 0) {
+      info.style.display = '';
+      info.textContent = 'Recorded: ' + _frames + ' frames';
+      dl.disabled = false;
+    } else {
+      info.style.display = 'none';
+      dl.disabled = true;
+    }
+  }
+}
+
+function post(url, body) {
+  fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).catch(function(){});
+}
+
+function toggleRecord() {
+  if (_isRecording) {
+    post('/api/record/stop', {});
+  } else {
+    post('/api/record/start', {});
+  }
+}
+
+function download() {
+  window.location.href = '/api/record/download';
+}
+</script>
+</body>
+</html>

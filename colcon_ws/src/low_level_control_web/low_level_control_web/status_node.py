@@ -120,23 +120,15 @@ class ControlNode(Node):
         # Per-motor current commanded position for display
         self._q_des: list = [0.0] * 12
 
-        # Recording state
-        self._recording: bool = False
-        self._record_buf: list[dict] = []   # list of flat dicts (one per frame)
-        self._record_t0: float = 0.0        # monotonic start time
-
-        # Exported file state
-        self._csv_ready: bool = False
-        self._xlsx_ready: bool = False
-        self._csv_path: str = ''
-        self._xlsx_path: str = ''
+        # Recording state — removed; use lowcmd_recording package instead.
 
         # Playback state
         self._playback_active: bool = False
         self._playback_t0: float = 0.0       # monotonic start time
         self._playback_duration: float = 0.0 # total duration of loaded trajectory
         self._playback_loaded: bool = False   # whether a trajectory is loaded
-        # Per-motor trajectory: list of 12, each a list of (time, q, dq) tuples sorted by time
+        # Per-motor trajectory: list of 12, each a list of
+        # (time, q, dq, tau|None, kp|None, kd|None) tuples sorted by time.
         self._playback_traj: list[list[tuple]] = [[] for _ in range(12)]
 
         # ROS subscriptions / publications
@@ -160,8 +152,6 @@ class ControlNode(Node):
         payload = lowstate_to_dict(msg)
         with self._lock:
             self._latest_status = payload
-            if self._recording:
-                self._record_frame(payload)
 
     def _publish_cmd(self) -> None:
         """Build and publish a LowCmd reflecting current control state."""
@@ -174,7 +164,7 @@ class ControlNode(Node):
             drag_lim = list(self._drag_tau_limit)
             dtorque = list(self._direct_torque)
             status = self._latest_status
-            # Playback: interpolate q and dq by elapsed time
+            # Playback: interpolate q, dq (and optionally tau, kp, kd) by elapsed time
             pb_active = self._playback_active
             if pb_active:
                 elapsed = _time.monotonic() - self._playback_t0
@@ -186,9 +176,15 @@ class ControlNode(Node):
                     for i in range(12):
                         traj = self._playback_traj[i]
                         if traj and cmds[i]['enabled']:
-                            q_interp, dq_interp = self._interp_traj(traj, elapsed)
-                            cmds[i]['q'] = q_interp
-                            cmds[i]['dq'] = dq_interp
+                            q_i, dq_i, tau_i, kp_i, kd_i = self._interp_traj(traj, elapsed)
+                            cmds[i]['q'] = q_i
+                            cmds[i]['dq'] = dq_i
+                            if tau_i is not None:
+                                cmds[i]['tau'] = tau_i
+                            if kp_i is not None:
+                                cmds[i]['kp'] = kp_i
+                            if kd_i is not None:
+                                cmds[i]['kd'] = kd_i
 
         # Drag mode: update position targets for joints where |tau_est| > limit
         if status is not None:
@@ -233,10 +229,8 @@ class ControlNode(Node):
                     mc.kp  = 0.0
                     mc.kd  = 0.0
                 else:
-                    # Sentinel: tell firmware to ignore position/velocity when
-                    # the corresponding gain is zero (prevents residual damping).
-                    mc.q   = POS_STOP_F if kp_val < 0.01 else float(c['q'])
-                    mc.dq  = VEL_STOP_F if kd_val < 0.01 else float(c['dq'])
+                    mc.q   = float(c['q'])
+                    mc.dq  = float(c['dq'])
                     mc.tau = tau_val
                     mc.kp  = kp_val
                     mc.kd  = kd_val
@@ -307,167 +301,22 @@ class ControlNode(Node):
         self._stop_event.set()
 
     # ------------------------------------------------------------------
-    # Recording
-    # ------------------------------------------------------------------
-
-    def _record_frame(self, s: dict) -> None:
-        """Flatten a lowstate dict into a single row and append to buffer.
-        Must be called while holding self._lock."""
-        t = _time.monotonic() - self._record_t0
-        row: dict = {'time': round(t, 6)}
-        # Motors 0-11
-        for i in range(12):
-            m = s['motors'][i] if i < len(s.get('motors', [])) else {}
-            for key in ('mode', 'q', 'dq', 'ddq', 'tau_est', 'q_raw', 'dq_raw',
-                        'ddq_raw', 'temperature', 'lost'):
-                row[f'motor{i}_{key}'] = m.get(key, '')
-        # IMU
-        imu = s.get('imu', {})
-        for j, name in enumerate(['w', 'x', 'y', 'z']):
-            row[f'imu_quat_{name}'] = imu.get('quaternion', [0]*4)[j] if j < len(imu.get('quaternion', [])) else ''
-        for j, name in enumerate(['x', 'y', 'z']):
-            row[f'imu_gyro_{name}'] = imu.get('gyroscope', [0]*3)[j] if j < len(imu.get('gyroscope', [])) else ''
-        for j, name in enumerate(['x', 'y', 'z']):
-            row[f'imu_acc_{name}'] = imu.get('accelerometer', [0]*3)[j] if j < len(imu.get('accelerometer', [])) else ''
-        for j, name in enumerate(['r', 'p', 'y']):
-            row[f'imu_rpy_{name}'] = imu.get('rpy', [0]*3)[j] if j < len(imu.get('rpy', [])) else ''
-        row['imu_temperature'] = imu.get('temperature', '')
-        # Foot force
-        ff = s.get('foot_force', [])
-        ffe = s.get('foot_force_est', [])
-        for j in range(4):
-            row[f'foot_force_{j}'] = ff[j] if j < len(ff) else ''
-            row[f'foot_force_est_{j}'] = ffe[j] if j < len(ffe) else ''
-        # Power / BMS
-        row['power_v'] = s.get('power_v', '')
-        row['power_a'] = s.get('power_a', '')
-        bms = s.get('bms', {})
-        row['bms_soc'] = bms.get('soc', '')
-        row['bms_current'] = bms.get('current', '')
-        row['tick'] = s.get('tick', '')
-        self._record_buf.append(row)
-
-    def start_recording(self) -> None:
-        """Start recording lowstate frames."""
-        with self._lock:
-            self._record_buf = []
-            self._record_t0 = _time.monotonic()
-            self._recording = True
-            self._csv_ready = False
-            self._xlsx_ready = False
-        self.get_logger().info('Recording started')
-
-    def stop_recording(self) -> int:
-        """Stop recording and return the number of frames captured."""
-        with self._lock:
-            self._recording = False
-            buf = list(self._record_buf)
-            self._csv_ready = False
-            self._xlsx_ready = False
-        n = len(buf)
-        self.get_logger().info(f'Recording stopped — {n} frames')
-        if n > 0:
-            threading.Thread(
-                target=self._export_files, args=(buf,), daemon=True,
-                name='export_files',
-            ).start()
-        return n
-
-    def _export_files(self, buf: list[dict]) -> None:
-        """Write CSV and XLSX to tmp dir. Called from a background thread."""
-        import csv as _csv
-        from common.workspace import TMP_DIR as _tmp_dir
-        headers = list(buf[0].keys())
-
-        # --- CSV ---
-        csv_path = _tmp_dir / 'lowstate_recording.csv'
-        with open(csv_path, 'w', newline='') as f:
-            w = _csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            w.writerows(buf)
-        with self._lock:
-            self._csv_path = str(csv_path)
-            self._csv_ready = True
-
-        # --- XLSX ---
-        xlsx_path = _tmp_dir / 'lowstate_recording.xlsx'
-        from openpyxl import Workbook
-        wb = Workbook(write_only=True)
-        ws = wb.create_sheet()
-        ws.append(headers)
-        for row in buf:
-            vals = []
-            for h in headers:
-                v = row.get(h)
-                if isinstance(v, str) and v != '':
-                    try:
-                        if '.' in v:
-                            v = float(v)
-                        else:
-                            v = int(v)
-                    except ValueError:
-                        pass
-                vals.append(v)
-            ws.append(vals)
-        wb.save(str(xlsx_path))
-
-        with self._lock:
-            self._xlsx_path = str(xlsx_path)
-            self._xlsx_ready = True
-        self.get_logger().info(f'Export complete: {csv_path}, {xlsx_path}')
-
-    def get_recording_csv(self) -> str:
-        """Return the recorded data as a CSV string."""
-        with self._lock:
-            buf = list(self._record_buf)
-        if not buf:
-            return ''
-        import io, csv
-        headers = list(buf[0].keys())
-        out = io.StringIO()
-        w = csv.DictWriter(out, fieldnames=headers)
-        w.writeheader()
-        w.writerows(buf)
-        return out.getvalue()
-
-    def get_file_paths(self) -> dict:
-        """Return paths to exported files (only includes ready ones)."""
-        with self._lock:
-            d = {}
-            if self._csv_ready:
-                d['csv'] = self._csv_path
-            if self._xlsx_ready:
-                d['xlsx'] = self._xlsx_path
-            return d
-
-    def get_recording_state(self) -> dict:
-        """Return current recording state."""
-        with self._lock:
-            return {
-                'recording': self._recording,
-                'frames':    len(self._record_buf),
-                'duration':  round(_time.monotonic() - self._record_t0, 2) if self._recording else 0.0,
-                'csv_ready': self._csv_ready,
-                'xlsx_ready': self._xlsx_ready,
-            }
-
-    # ------------------------------------------------------------------
     # Playback
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _interp_traj(traj: list[tuple], t: float) -> tuple[float, float]:
-        """Linearly interpolate (q, dq) from a sorted trajectory at time *t*.
+    def _interp_traj(traj: list[tuple], t: float) -> tuple:
+        """Linearly interpolate (q, dq, tau, kp, kd) from a sorted trajectory.
 
-        *traj* is a list of (time, q, dq) tuples sorted by time.
-        Returns (q, dq) at time *t*.
+        *traj* is a list of (time, q, dq, tau|None, kp|None, kd|None) tuples.
+        Returns (q, dq, tau|None, kp|None, kd|None).
         """
         if not traj:
-            return 0.0, 0.0
+            return 0.0, 0.0, None, None, None
         if t <= traj[0][0]:
-            return traj[0][1], traj[0][2]
+            return traj[0][1], traj[0][2], traj[0][3], traj[0][4], traj[0][5]
         if t >= traj[-1][0]:
-            return traj[-1][1], traj[-1][2]
+            return traj[-1][1], traj[-1][2], traj[-1][3], traj[-1][4], traj[-1][5]
         # Binary search for the interval
         lo, hi = 0, len(traj) - 1
         while lo < hi - 1:
@@ -476,16 +325,42 @@ class ControlNode(Node):
                 lo = mid
             else:
                 hi = mid
-        t0, q0, dq0 = traj[lo]
-        t1, q1, dq1 = traj[hi]
+        t0, q0, dq0, tau0, kp0, kd0 = traj[lo]
+        t1, q1, dq1, tau1, kp1, kd1 = traj[hi]
         dt = t1 - t0
         if dt < 1e-9:
-            return q1, dq1
+            return q1, dq1, tau1, kp1, kd1
         alpha = (t - t0) / dt
-        return q0 + alpha * (q1 - q0), dq0 + alpha * (dq1 - dq0)
 
-    def load_playback_csv(self, csv_text: str) -> dict:
-        """Parse a CSV string (same format as recording) into playback trajectories.
+        def _lerp(a, b):
+            if a is None or b is None:
+                return b
+            return a + alpha * (b - a)
+
+        return (
+            q0 + alpha * (q1 - q0),
+            dq0 + alpha * (dq1 - dq0),
+            _lerp(tau0, tau1),
+            _lerp(kp0, kp1),
+            _lerp(kd0, kd1),
+        )
+
+    def load_playback_csv(self, csv_text: str,
+                          q_source: str = 'cmd',
+                          dq_source: str = 'cmd',
+                          track_tau: bool = False,
+                          track_kp: bool = False,
+                          track_kd: bool = False) -> dict:
+        """Parse a lowcmd_recording CSV into playback trajectories.
+
+        *q_source*/*dq_source*: ``'cmd'`` or ``'state'`` — which column to read.
+        *track_tau/kp/kd*: whether to include those fields from cmd columns.
+
+        Columns expected (lowcmd_recording format):
+            time, cmd{i}_q, cmd{i}_dq, cmd{i}_tau, cmd{i}_kp, cmd{i}_kd,
+                  state{i}_q, state{i}_dq
+        Also accepts legacy format:
+            time, motor{i}_q, motor{i}_dq
 
         Returns {'ok': True, 'duration': ..., 'frames': ...} or raises ValueError.
         """
@@ -494,20 +369,48 @@ class ControlNode(Node):
         rows = list(reader)
         if not rows:
             raise ValueError('CSV is empty')
-        # Check required columns
         if 'time' not in rows[0]:
             raise ValueError('CSV must have a "time" column')
+
+        # Detect format
+        is_lowcmd_fmt = 'cmd0_q' in rows[0]
+        is_legacy_fmt = 'motor0_q' in rows[0]
+        if not is_lowcmd_fmt and not is_legacy_fmt:
+            raise ValueError('CSV must contain cmd0_q or motor0_q columns')
+
         traj: list[list[tuple]] = [[] for _ in range(12)]
         for row in rows:
             t = float(row['time'])
             for i in range(12):
-                q_key  = f'motor{i}_q'
-                dq_key = f'motor{i}_dq'
-                if q_key in row and row[q_key] != '':
-                    q_val  = float(row[q_key])
-                    dq_val = float(row[dq_key]) if dq_key in row and row[dq_key] != '' else 0.0
-                    traj[i].append((t, q_val, dq_val))
-        # Sort by time (should already be sorted, but ensure)
+                if is_lowcmd_fmt:
+                    # q source
+                    q_key = f'cmd{i}_q' if q_source == 'cmd' else f'state{i}_q'
+                    dq_key = f'cmd{i}_dq' if dq_source == 'cmd' else f'state{i}_dq'
+                else:
+                    q_key = f'motor{i}_q'
+                    dq_key = f'motor{i}_dq'
+
+                if q_key not in row or row[q_key] == '':
+                    continue
+                q_val = float(row[q_key])
+                dq_val = float(row[dq_key]) if dq_key in row and row[dq_key] != '' else 0.0
+
+                tau_val = None
+                kp_val = None
+                kd_val = None
+                if is_lowcmd_fmt:
+                    if track_tau:
+                        k = f'cmd{i}_tau'
+                        tau_val = float(row[k]) if k in row and row[k] != '' else 0.0
+                    if track_kp:
+                        k = f'cmd{i}_kp'
+                        kp_val = float(row[k]) if k in row and row[k] != '' else None
+                    if track_kd:
+                        k = f'cmd{i}_kd'
+                        kd_val = float(row[k]) if k in row and row[k] != '' else None
+
+                traj[i].append((t, q_val, dq_val, tau_val, kp_val, kd_val))
+
         for i in range(12):
             traj[i].sort(key=lambda x: x[0])
         duration = max((tr[-1][0] if tr else 0.0) for tr in traj)

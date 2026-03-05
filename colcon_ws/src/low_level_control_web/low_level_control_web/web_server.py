@@ -7,14 +7,12 @@ Routes:
   POST   /api/cmd                → set target for one motor  (body: MotorCmdRequest)
   POST   /api/estop              → activate emergency stop
   DELETE /api/estop              → clear emergency stop
-  POST   /api/record/start       → start recording lowstate frames
-  POST   /api/record/stop        → stop recording
-  GET    /api/record/download    → download recorded data as CSV (from disk)
-  GET    /api/record/download/xlsx → download recorded data as Excel xlsx (from disk)
-  GET    /api/record/state       → current recording state
   GET    /api/services           → current status of 4 managed services
   POST   /api/service/{name}/start → start a service by name
   POST   /api/service/{name}/stop  → stop a service by name
+  POST   /api/playback/upload    → upload lowcmd_recording CSV for playback
+  POST   /api/playback/start     → start playback
+  POST   /api/playback/stop      → stop playback
   WS     /ws                     → push {status + control + services} JSON at ~10 Hz
 """
 
@@ -29,8 +27,8 @@ from typing import Set
 
 from common.service_client import ServiceClient
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title='Go2 Low-Level Control')
@@ -141,7 +139,6 @@ async def _broadcaster() -> None:
             if status is not None:
                 try:
                     payload = {**status, 'control': ctrl}
-                    payload['recording'] = _status_capture.get_recording_state()
                     if _svc_poller is not None:
                         svc = _svc_poller.get_services()
                         payload['services']       = svc['services']
@@ -237,69 +234,38 @@ async def api_estop_off() -> JSONResponse:
     return JSONResponse({'ok': True, 'estop': False})
 
 
-@app.post('/api/record/start', response_class=JSONResponse)
-async def api_record_start() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    _status_capture.start_recording()
-    return JSONResponse({'ok': True})
-
-
-@app.post('/api/record/stop', response_class=JSONResponse)
-async def api_record_stop() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    n = _status_capture.stop_recording()
-    return JSONResponse({'ok': True, 'frames': n})
-
-
-@app.get('/api/record/download')
-async def api_record_download():
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    paths = _status_capture.get_file_paths()
-    csv_path = paths.get('csv')
-    if not csv_path:
-        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
-    return FileResponse(
-        csv_path,
-        media_type='text/csv',
-        filename='lowstate_recording.csv',
-    )
-
-
-@app.get('/api/record/download/xlsx')
-async def api_record_download_xlsx():
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    paths = _status_capture.get_file_paths()
-    xlsx_path = paths.get('xlsx')
-    if not xlsx_path:
-        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
-    return FileResponse(
-        xlsx_path,
-        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        filename='lowstate_recording.xlsx',
-    )
-
-
-@app.get('/api/record/state', response_class=JSONResponse)
-async def api_record_state() -> JSONResponse:
-    if _status_capture is None:
-        return JSONResponse({'error': 'not ready'}, status_code=503)
-    return JSONResponse(_status_capture.get_recording_state())
-
-
 # ── Playback ────────────────────────────────────────────────
 
+class PlaybackUploadOptions(BaseModel):
+    q_source:  str  = 'cmd'    # 'cmd' or 'state'
+    dq_source: str  = 'cmd'    # 'cmd' or 'state'
+    track_tau: bool = False
+    track_kp:  bool = False
+    track_kd:  bool = False
+
+
 @app.post('/api/playback/upload', response_class=JSONResponse)
-async def api_playback_upload(file: UploadFile = File(...)) -> JSONResponse:
+async def api_playback_upload(
+    file: UploadFile = File(...),
+    q_source: str = Form('cmd'),
+    dq_source: str = Form('cmd'),
+    track_tau: str = Form('false'),
+    track_kp: str = Form('false'),
+    track_kd: str = Form('false'),
+) -> JSONResponse:
     if _status_capture is None:
         return JSONResponse({'error': 'not ready'}, status_code=503)
     raw = await file.read()
     text = raw.decode('utf-8', errors='replace')
     try:
-        result = _status_capture.load_playback_csv(text)
+        result = _status_capture.load_playback_csv(
+            text,
+            q_source=q_source,
+            dq_source=dq_source,
+            track_tau=track_tau.lower() == 'true',
+            track_kp=track_kp.lower() == 'true',
+            track_kd=track_kd.lower() == 'true',
+        )
     except (ValueError, KeyError, Exception) as exc:
         return JSONResponse({'ok': False, 'error': str(exc)}, status_code=400)
     return JSONResponse(result)

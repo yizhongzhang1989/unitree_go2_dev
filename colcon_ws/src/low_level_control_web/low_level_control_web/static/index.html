@@ -192,19 +192,8 @@
     #drag-btn.on  { background: #f59e0b; color: #000; }
     #drag-btn.off { background: #2e3147; color: var(--text); }
 
-    #rec-btn {
-      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
-      font-size: 13px; font-weight: 600;
-    }
-    #rec-btn.recording { background: var(--red); color: #fff; animation: rec-pulse 1s infinite; }
-    #rec-btn.idle       { background: #2e3147;    color: var(--text); }
-    @keyframes rec-pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
-    .dl-btn {
-      flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
-      font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text);
-    }
-
     /* Playback */
+    @keyframes rec-pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
     #play-btn {
       flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
       font-size: 13px; font-weight: 600;
@@ -217,6 +206,10 @@
       font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text); cursor: pointer;
     }
     #csv-file { display: none; }
+    .card select {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 4px; padding: 2px 4px; font-size: 12px;
+    }
 
     /* Right column — motor card grid */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
@@ -547,23 +540,18 @@
       </div>
     </div>
 
-    <!-- Recording -->
-    <div class="card">
-      <div class="card-title">Recording</div>
-      <div class="btn-row" style="flex-direction:column;gap:10px;">
-        <button id="rec-btn" class="idle" onclick="toggleRecord()">&#9210; Start Recording</button>
-        <div id="rec-info" style="font-size:12px;color:var(--muted);display:none"></div>
-        <div style="display:flex;gap:6px">
-          <button class="dl-btn" id="dl-csv-btn" onclick="window.location.href='/api/record/download'" disabled>&#11015; Download CSV</button>
-          <button class="dl-btn" id="dl-xlsx-btn" onclick="window.location.href='/api/record/download/xlsx'" disabled>&#11015; Download xlsx</button>
-        </div>
-      </div>
-    </div>
-
     <!-- Playback -->
     <div class="card">
       <div class="card-title">Playback</div>
       <div class="btn-row" style="flex-direction:column;gap:10px;">
+        <!-- Options -->
+        <div style="font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;">
+          <label>q: <select id="pb-q-src"><option value="cmd" selected>cmd_q</option><option value="state">state_q</option></select></label>
+          <label>dq: <select id="pb-dq-src"><option value="cmd" selected>cmd_dq</option><option value="state">state_dq</option></select></label>
+          <label><input type="checkbox" id="pb-tau"> tau</label>
+          <label><input type="checkbox" id="pb-kp"> Kp</label>
+          <label><input type="checkbox" id="pb-kd"> Kd</label>
+        </div>
         <input type="file" id="csv-file" accept=".csv" onchange="uploadCSV(this)">
         <button id="upload-btn" onclick="document.getElementById('csv-file').click()">&#128194; Upload CSV</button>
         <div id="pb-info" style="font-size:12px;color:var(--muted);display:none"></div>
@@ -697,8 +685,6 @@ let _showExtended  = false;
 let _showSystem    = false;
 let _showPlots     = false;
 let _dragMode      = false;
-let _isRecording   = false;
-let _recordFrames  = 0;
 let _directTorque  = false;
 let _isPlaying     = false;
 let _playbackLoaded = false;
@@ -939,42 +925,6 @@ function onStatus(s) {
   // E-stop buttons
   document.getElementById('estop-btn').style.display       = _estop ? 'none' : '';
   document.getElementById('clear-estop-btn').style.display = _estop ? '' : 'none';
-
-  // Recording state
-  var rec = s.recording || {};
-  _isRecording = rec.recording || false;
-  _recordFrames = rec.frames || 0;
-  var recBtn = document.getElementById('rec-btn');
-  var recInfo = document.getElementById('rec-info');
-  var dlCsv = document.getElementById('dl-csv-btn');
-  var dlXlsx = document.getElementById('dl-xlsx-btn');
-  var csvReady = rec.csv_ready || false;
-  var xlsxReady = rec.xlsx_ready || false;
-  if (_isRecording) {
-    recBtn.innerHTML = '&#9209; Stop Recording';
-    recBtn.className = 'recording';
-    recInfo.style.display = '';
-    recInfo.textContent = 'Recording: ' + _recordFrames + ' frames, ' + (rec.duration || 0).toFixed(1) + 's';
-    dlCsv.disabled = true;
-    dlXlsx.disabled = true;
-  } else {
-    recBtn.innerHTML = '&#9210; Start Recording';
-    recBtn.className = 'idle';
-    if (_recordFrames > 0) {
-      recInfo.style.display = '';
-      if (csvReady && xlsxReady) {
-        recInfo.textContent = 'Recorded: ' + _recordFrames + ' frames';
-      } else {
-        recInfo.textContent = 'Exporting ' + _recordFrames + ' frames…';
-      }
-      dlCsv.disabled = !csvReady;
-      dlXlsx.disabled = !xlsxReady;
-    } else {
-      recInfo.style.display = 'none';
-      dlCsv.disabled = true;
-      dlXlsx.disabled = true;
-    }
-  }
 
   // Playback state
   var pb = (s.control && s.control.playback) || {};
@@ -1419,23 +1369,17 @@ function onFreqSlider(val) {
 }
 
 // ============================================================
-// Recording
-// ============================================================
-function toggleRecord() {
-  if (_isRecording) {
-    post('/api/record/stop', {});
-  } else {
-    post('/api/record/start', {});
-  }
-}
-
-// ============================================================
 // Playback
 // ============================================================
 function uploadCSV(input) {
   if (!input.files.length) return;
   var fd = new FormData();
   fd.append('file', input.files[0]);
+  fd.append('q_source',  document.getElementById('pb-q-src').value);
+  fd.append('dq_source', document.getElementById('pb-dq-src').value);
+  fd.append('track_tau', document.getElementById('pb-tau').checked);
+  fd.append('track_kp',  document.getElementById('pb-kp').checked);
+  fd.append('track_kd',  document.getElementById('pb-kd').checked);
   fetch('/api/playback/upload', { method: 'POST', body: fd })
     .then(r => r.json())
     .then(j => {

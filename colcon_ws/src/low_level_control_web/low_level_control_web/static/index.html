@@ -199,7 +199,7 @@
     #rec-btn.recording { background: var(--red); color: #fff; animation: rec-pulse 1s infinite; }
     #rec-btn.idle       { background: #2e3147;    color: var(--text); }
     @keyframes rec-pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
-    #dl-btn {
+    .dl-btn {
       flex: 1; padding: 10px 14px; border: none; border-radius: 6px;
       font-size: 13px; font-weight: 600; background: #2e3147; color: var(--text);
     }
@@ -553,7 +553,10 @@
       <div class="btn-row" style="flex-direction:column;gap:10px;">
         <button id="rec-btn" class="idle" onclick="toggleRecord()">&#9210; Start Recording</button>
         <div id="rec-info" style="font-size:12px;color:var(--muted);display:none"></div>
-        <button id="dl-btn" onclick="downloadRecording()" disabled>&#11015; Download CSV</button>
+        <div style="display:flex;gap:6px">
+          <button class="dl-btn" id="dl-csv-btn" onclick="window.location.href='/api/record/download'" disabled>&#11015; Download CSV</button>
+          <button class="dl-btn" id="dl-xlsx-btn" onclick="window.location.href='/api/record/download/xlsx'" disabled>&#11015; Download xlsx</button>
+        </div>
       </div>
     </div>
 
@@ -943,23 +946,33 @@ function onStatus(s) {
   _recordFrames = rec.frames || 0;
   var recBtn = document.getElementById('rec-btn');
   var recInfo = document.getElementById('rec-info');
-  var dlBtn = document.getElementById('dl-btn');
+  var dlCsv = document.getElementById('dl-csv-btn');
+  var dlXlsx = document.getElementById('dl-xlsx-btn');
+  var csvReady = rec.csv_ready || false;
+  var xlsxReady = rec.xlsx_ready || false;
   if (_isRecording) {
     recBtn.innerHTML = '&#9209; Stop Recording';
     recBtn.className = 'recording';
     recInfo.style.display = '';
     recInfo.textContent = 'Recording: ' + _recordFrames + ' frames, ' + (rec.duration || 0).toFixed(1) + 's';
-    dlBtn.disabled = true;
+    dlCsv.disabled = true;
+    dlXlsx.disabled = true;
   } else {
     recBtn.innerHTML = '&#9210; Start Recording';
     recBtn.className = 'idle';
     if (_recordFrames > 0) {
       recInfo.style.display = '';
-      recInfo.textContent = 'Recorded: ' + _recordFrames + ' frames';
-      dlBtn.disabled = false;
+      if (csvReady && xlsxReady) {
+        recInfo.textContent = 'Recorded: ' + _recordFrames + ' frames';
+      } else {
+        recInfo.textContent = 'Exporting ' + _recordFrames + ' frames…';
+      }
+      dlCsv.disabled = !csvReady;
+      dlXlsx.disabled = !xlsxReady;
     } else {
       recInfo.style.display = 'none';
-      dlBtn.disabled = true;
+      dlCsv.disabled = true;
+      dlXlsx.disabled = true;
     }
   }
 
@@ -1414,9 +1427,6 @@ function toggleRecord() {
   } else {
     post('/api/record/start', {});
   }
-}
-function downloadRecording() {
-  window.location.href = '/api/record/download';
 }
 
 // ============================================================

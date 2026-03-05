@@ -9,6 +9,7 @@ import csv
 import io
 import threading
 import time as _time
+from pathlib import Path
 from typing import Optional
 
 from unitree_sdk2py.core.channel import (
@@ -28,6 +29,8 @@ MOTOR_NAMES = [
 # Sentinel constants the firmware uses to mean "ignore this field".
 POS_STOP_F: float = 2.146e9
 VEL_STOP_F: float = 16000.0
+
+from common.workspace import TMP_DIR as _TMP_DIR
 
 
 def _ff(val: float, ndigits: int = 6) -> str:
@@ -53,6 +56,12 @@ class Recorder:
         self._recording: bool = False
         self._record_buf: list[dict] = []
         self._record_t0: float = 0.0
+
+        # Exported file state
+        self._csv_ready: bool = False
+        self._xlsx_ready: bool = False
+        self._csv_path: str = ''
+        self._xlsx_path: str = ''
 
         # Initialise Unitree SDK2 DDS channel
         ChannelFactoryInitialize(0, network_interface)
@@ -190,13 +199,67 @@ class Recorder:
             self._record_buf = []
             self._record_t0 = _time.monotonic()
             self._recording = True
+            self._csv_ready = False
+            self._xlsx_ready = False
 
     def stop_recording(self) -> int:
         with self._lock:
             self._recording = False
-            return len(self._record_buf)
+            buf = list(self._record_buf)
+            self._csv_ready = False
+            self._xlsx_ready = False
+        n = len(buf)
+        # Write CSV + XLSX to tmp dir in a background thread.
+        if n > 0:
+            threading.Thread(
+                target=self._export_files, args=(buf,), daemon=True,
+                name='export_files',
+            ).start()
+        return n
+
+    def _export_files(self, buf: list[dict]) -> None:
+        """Write CSV and XLSX to _TMP_DIR. Called from a background thread."""
+        headers = list(buf[0].keys())
+
+        # --- CSV ---
+        csv_path = _TMP_DIR / 'lowcmd_recording.csv'
+        with open(csv_path, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerows(buf)
+        with self._lock:
+            self._csv_path = str(csv_path)
+            self._csv_ready = True
+
+        # --- XLSX ---
+        xlsx_path = _TMP_DIR / 'lowcmd_recording.xlsx'
+        from openpyxl import Workbook
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet()
+        ws.append(headers)
+        for row in buf:
+            vals = []
+            for h in headers:
+                v = row.get(h)
+                # Convert _ff()-formatted strings back to numbers for xlsx.
+                if isinstance(v, str) and v != '':
+                    try:
+                        if '.' in v:
+                            v = float(v)
+                        else:
+                            v = int(v)
+                    except ValueError:
+                        pass
+                vals.append(v)
+            ws.append(vals)
+        wb.save(str(xlsx_path))
+
+        with self._lock:
+            self._xlsx_path = str(xlsx_path)
+            self._xlsx_ready = True
 
     def get_recording_csv(self) -> str:
+        """Return the CSV as a string (for backwards compat)."""
         with self._lock:
             buf = list(self._record_buf)
         if not buf:
@@ -208,12 +271,24 @@ class Recorder:
         w.writerows(buf)
         return out.getvalue()
 
+    def get_file_paths(self) -> dict:
+        """Return paths to exported files (only includes ready ones)."""
+        with self._lock:
+            d = {}
+            if self._csv_ready:
+                d['csv'] = self._csv_path
+            if self._xlsx_ready:
+                d['xlsx'] = self._xlsx_path
+            return d
+
     def get_state(self) -> dict:
         with self._lock:
             return {
                 'recording': self._recording,
                 'frames': len(self._record_buf),
                 'duration': round(_time.monotonic() - self._record_t0, 2) if self._recording else 0.0,
+                'csv_ready': self._csv_ready,
+                'xlsx_ready': self._xlsx_ready,
             }
 
     def shutdown(self) -> None:

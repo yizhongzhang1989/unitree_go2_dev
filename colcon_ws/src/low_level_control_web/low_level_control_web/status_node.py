@@ -125,6 +125,12 @@ class ControlNode(Node):
         self._record_buf: list[dict] = []   # list of flat dicts (one per frame)
         self._record_t0: float = 0.0        # monotonic start time
 
+        # Exported file state
+        self._csv_ready: bool = False
+        self._xlsx_ready: bool = False
+        self._csv_path: str = ''
+        self._xlsx_path: str = ''
+
         # Playback state
         self._playback_active: bool = False
         self._playback_t0: float = 0.0       # monotonic start time
@@ -347,15 +353,68 @@ class ControlNode(Node):
             self._record_buf = []
             self._record_t0 = _time.monotonic()
             self._recording = True
+            self._csv_ready = False
+            self._xlsx_ready = False
         self.get_logger().info('Recording started')
 
     def stop_recording(self) -> int:
         """Stop recording and return the number of frames captured."""
         with self._lock:
             self._recording = False
-            n = len(self._record_buf)
+            buf = list(self._record_buf)
+            self._csv_ready = False
+            self._xlsx_ready = False
+        n = len(buf)
         self.get_logger().info(f'Recording stopped — {n} frames')
+        if n > 0:
+            threading.Thread(
+                target=self._export_files, args=(buf,), daemon=True,
+                name='export_files',
+            ).start()
         return n
+
+    def _export_files(self, buf: list[dict]) -> None:
+        """Write CSV and XLSX to tmp dir. Called from a background thread."""
+        import csv as _csv
+        from common.workspace import TMP_DIR as _tmp_dir
+        headers = list(buf[0].keys())
+
+        # --- CSV ---
+        csv_path = _tmp_dir / 'lowstate_recording.csv'
+        with open(csv_path, 'w', newline='') as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerows(buf)
+        with self._lock:
+            self._csv_path = str(csv_path)
+            self._csv_ready = True
+
+        # --- XLSX ---
+        xlsx_path = _tmp_dir / 'lowstate_recording.xlsx'
+        from openpyxl import Workbook
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet()
+        ws.append(headers)
+        for row in buf:
+            vals = []
+            for h in headers:
+                v = row.get(h)
+                if isinstance(v, str) and v != '':
+                    try:
+                        if '.' in v:
+                            v = float(v)
+                        else:
+                            v = int(v)
+                    except ValueError:
+                        pass
+                vals.append(v)
+            ws.append(vals)
+        wb.save(str(xlsx_path))
+
+        with self._lock:
+            self._xlsx_path = str(xlsx_path)
+            self._xlsx_ready = True
+        self.get_logger().info(f'Export complete: {csv_path}, {xlsx_path}')
 
     def get_recording_csv(self) -> str:
         """Return the recorded data as a CSV string."""
@@ -371,6 +430,16 @@ class ControlNode(Node):
         w.writerows(buf)
         return out.getvalue()
 
+    def get_file_paths(self) -> dict:
+        """Return paths to exported files (only includes ready ones)."""
+        with self._lock:
+            d = {}
+            if self._csv_ready:
+                d['csv'] = self._csv_path
+            if self._xlsx_ready:
+                d['xlsx'] = self._xlsx_path
+            return d
+
     def get_recording_state(self) -> dict:
         """Return current recording state."""
         with self._lock:
@@ -378,6 +447,8 @@ class ControlNode(Node):
                 'recording': self._recording,
                 'frames':    len(self._record_buf),
                 'duration':  round(_time.monotonic() - self._record_t0, 2) if self._recording else 0.0,
+                'csv_ready': self._csv_ready,
+                'xlsx_ready': self._xlsx_ready,
             }
 
     # ------------------------------------------------------------------

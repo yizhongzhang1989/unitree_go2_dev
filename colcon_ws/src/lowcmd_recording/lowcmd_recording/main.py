@@ -19,7 +19,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 from common.config import load_config
 from lowcmd_recording.recorder import Recorder
@@ -97,15 +97,33 @@ async def api_stop() -> JSONResponse:
     return JSONResponse({'ok': True, 'frames': n})
 
 
-@app.get('/api/record/download', response_class=PlainTextResponse)
-async def api_download() -> PlainTextResponse:
+@app.get('/api/record/download')
+async def api_download():
     if _recorder is None:
-        return PlainTextResponse('not ready', status_code=503)
-    csv_text = _recorder.get_recording_csv()
-    return PlainTextResponse(
-        csv_text,
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    paths = _recorder.get_file_paths()
+    csv_path = paths.get('csv')
+    if not csv_path:
+        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
+    return FileResponse(
+        csv_path,
         media_type='text/csv',
-        headers={'Content-Disposition': 'attachment; filename="lowcmd_recording.csv"'},
+        filename='lowcmd_recording.csv',
+    )
+
+
+@app.get('/api/record/download/xlsx')
+async def api_download_xlsx():
+    if _recorder is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    paths = _recorder.get_file_paths()
+    xlsx_path = paths.get('xlsx')
+    if not xlsx_path:
+        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
+    return FileResponse(
+        xlsx_path,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        filename='lowcmd_recording.xlsx',
     )
 
 

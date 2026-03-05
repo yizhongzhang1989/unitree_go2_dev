@@ -9,7 +9,8 @@ Routes:
   DELETE /api/estop              → clear emergency stop
   POST   /api/record/start       → start recording lowstate frames
   POST   /api/record/stop        → stop recording
-  GET    /api/record/download    → download recorded data as CSV
+  GET    /api/record/download    → download recorded data as CSV (from disk)
+  GET    /api/record/download/xlsx → download recorded data as Excel xlsx (from disk)
   GET    /api/record/state       → current recording state
   GET    /api/services           → current status of 4 managed services
   POST   /api/service/{name}/start → start a service by name
@@ -29,7 +30,7 @@ from typing import Set
 from common.service_client import ServiceClient
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title='Go2 Low-Level Control')
@@ -256,13 +257,29 @@ async def api_record_stop() -> JSONResponse:
 async def api_record_download():
     if _status_capture is None:
         return JSONResponse({'error': 'not ready'}, status_code=503)
-    csv_data = _status_capture.get_recording_csv()
-    if not csv_data:
-        return JSONResponse({'error': 'no recording data'}, status_code=404)
-    return PlainTextResponse(
-        content=csv_data,
+    paths = _status_capture.get_file_paths()
+    csv_path = paths.get('csv')
+    if not csv_path:
+        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
+    return FileResponse(
+        csv_path,
         media_type='text/csv',
-        headers={'Content-Disposition': 'attachment; filename="recording.csv"'},
+        filename='lowstate_recording.csv',
+    )
+
+
+@app.get('/api/record/download/xlsx')
+async def api_record_download_xlsx():
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    paths = _status_capture.get_file_paths()
+    xlsx_path = paths.get('xlsx')
+    if not xlsx_path:
+        return JSONResponse({'error': 'files not ready yet'}, status_code=404)
+    return FileResponse(
+        xlsx_path,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        filename='lowstate_recording.xlsx',
     )
 
 

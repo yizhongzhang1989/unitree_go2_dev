@@ -36,8 +36,8 @@
   #rec-btn.idle      { background: #2e3147; color: var(--text); }
   #rec-btn.recording { background: var(--red); color: #fff; animation: pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
-  #dl-btn { background: #2e3147; color: var(--text); }
-  #dl-btn:disabled { opacity: .4; cursor: not-allowed; }
+  .dl-btn { background: #2e3147; color: var(--text); }
+  .dl-btn:disabled { opacity: .4; cursor: not-allowed; }
   .info { font-size: 12px; color: var(--muted); margin-top: 8px; }
   table {
     width: 100%; border-collapse: collapse; font-size: 12px;
@@ -65,7 +65,8 @@
   <div class="card-title">Recording</div>
   <div class="btn-row">
     <button id="rec-btn" class="idle" onclick="toggleRecord()">&#9210; Start Recording</button>
-    <button id="dl-btn" onclick="download()" disabled>&#11015; Download CSV</button>
+    <button class="dl-btn" id="dl-csv-btn" onclick="window.location.href='/api/record/download'" disabled>&#11015; Download CSV</button>
+    <button class="dl-btn" id="dl-xlsx-btn" onclick="window.location.href='/api/record/download/xlsx'" disabled>&#11015; Download xlsx</button>
   </div>
   <div class="info" id="rec-info" style="display:none"></div>
 </div>
@@ -167,23 +168,33 @@ function onData(s) {
   _frames = rec.frames || 0;
   var btn = document.getElementById('rec-btn');
   var info = document.getElementById('rec-info');
-  var dl = document.getElementById('dl-btn');
+  var dlCsv = document.getElementById('dl-csv-btn');
+  var dlXlsx = document.getElementById('dl-xlsx-btn');
+  var csvReady = rec.csv_ready || false;
+  var xlsxReady = rec.xlsx_ready || false;
   if (_isRecording) {
     btn.innerHTML = '&#9209; Stop Recording';
     btn.className = 'recording';
     info.style.display = '';
     info.textContent = 'Recording: ' + _frames + ' frames, ' + (rec.duration || 0).toFixed(1) + 's';
-    dl.disabled = true;
+    dlCsv.disabled = true;
+    dlXlsx.disabled = true;
   } else {
     btn.innerHTML = '&#9210; Start Recording';
     btn.className = 'idle';
     if (_frames > 0) {
       info.style.display = '';
-      info.textContent = 'Recorded: ' + _frames + ' frames';
-      dl.disabled = false;
+      if (csvReady && xlsxReady) {
+        info.textContent = 'Recorded: ' + _frames + ' frames';
+      } else {
+        info.textContent = 'Exporting ' + _frames + ' frames…';
+      }
+      dlCsv.disabled = !csvReady;
+      dlXlsx.disabled = !xlsxReady;
     } else {
       info.style.display = 'none';
-      dl.disabled = true;
+      dlCsv.disabled = true;
+      dlXlsx.disabled = true;
     }
   }
 }
@@ -202,10 +213,6 @@ function toggleRecord() {
   } else {
     post('/api/record/start', {});
   }
-}
-
-function download() {
-  window.location.href = '/api/record/download';
 }
 </script>
 </body>

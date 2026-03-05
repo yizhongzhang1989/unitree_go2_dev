@@ -27,3 +27,6 @@ Thumbs.db
 
 # Local robot config (copy of config/robot.yaml.template — never commit real settings)
 config/robot.yaml
+
+# Temporary recording files
+tmp/

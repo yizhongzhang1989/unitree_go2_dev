@@ -25,6 +25,19 @@ MOTOR_NAMES = [
     'RL_0', 'RL_1', 'RL_2',   # Rear-Left    9-11
 ]
 
+# Sentinel constants the firmware uses to mean "ignore this field".
+POS_STOP_F: float = 2.146e9
+VEL_STOP_F: float = 16000.0
+
+
+def _ff(val: float, ndigits: int = 6) -> str:
+    """Format a float for CSV: integer-valued floats get a trailing dot (e.g. '0.'),
+    otherwise use *ndigits* decimal places with trailing zeros stripped."""
+    r = round(float(val), ndigits)
+    if r == int(r):
+        return f'{int(r)}.'
+    return f'{r}'
+
 
 class Recorder:
     """Subscribes to rt/lowcmd and rt/lowstate; records combined snapshots."""
@@ -69,7 +82,7 @@ class Recorder:
     def _record_frame(self) -> None:
         """Append one row combining cmd + state. Must hold self._lock."""
         t = _time.monotonic() - self._record_t0
-        row: dict = {'time': round(t, 6)}
+        row: dict = {'time': _ff(t, 6)}
 
         cmd = self._latest_cmd
         state = self._latest_state
@@ -78,12 +91,14 @@ class Recorder:
             # Command side
             if cmd is not None:
                 mc = cmd.motor_cmd[i]
+                q_raw = float(mc.q)
+                dq_raw = float(mc.dq)
                 row[f'cmd{i}_mode'] = int(mc.mode)
-                row[f'cmd{i}_q'] = round(float(mc.q), 6)
-                row[f'cmd{i}_dq'] = round(float(mc.dq), 6)
-                row[f'cmd{i}_tau'] = round(float(mc.tau), 6)
-                row[f'cmd{i}_kp'] = round(float(mc.kp), 4)
-                row[f'cmd{i}_kd'] = round(float(mc.kd), 4)
+                row[f'cmd{i}_q'] = _ff(0.0) if q_raw == POS_STOP_F else _ff(q_raw, 6)
+                row[f'cmd{i}_dq'] = _ff(0.0) if dq_raw == VEL_STOP_F else _ff(dq_raw, 6)
+                row[f'cmd{i}_tau'] = _ff(mc.tau, 6)
+                row[f'cmd{i}_kp'] = _ff(mc.kp, 4)
+                row[f'cmd{i}_kd'] = _ff(mc.kd, 4)
             else:
                 row[f'cmd{i}_mode'] = ''
                 row[f'cmd{i}_q'] = ''
@@ -96,10 +111,10 @@ class Recorder:
             if state is not None:
                 ms = state.motor_state[i]
                 row[f'state{i}_mode'] = int(ms.mode)
-                row[f'state{i}_q'] = round(float(ms.q), 6)
-                row[f'state{i}_dq'] = round(float(ms.dq), 6)
-                row[f'state{i}_ddq'] = round(float(ms.ddq), 6)
-                row[f'state{i}_tau_est'] = round(float(ms.tau_est), 6)
+                row[f'state{i}_q'] = _ff(ms.q, 6)
+                row[f'state{i}_dq'] = _ff(ms.dq, 6)
+                row[f'state{i}_ddq'] = _ff(ms.ddq, 6)
+                row[f'state{i}_tau_est'] = _ff(ms.tau_est, 6)
                 row[f'state{i}_temp'] = int(ms.temperature)
             else:
                 row[f'state{i}_mode'] = ''
@@ -113,13 +128,13 @@ class Recorder:
         if state is not None:
             imu = state.imu_state
             for j, name in enumerate(['w', 'x', 'y', 'z']):
-                row[f'imu_quat_{name}'] = round(float(imu.quaternion[j]), 6)
+                row[f'imu_quat_{name}'] = _ff(imu.quaternion[j], 6)
             for j, name in enumerate(['x', 'y', 'z']):
-                row[f'imu_gyro_{name}'] = round(float(imu.gyroscope[j]), 6)
+                row[f'imu_gyro_{name}'] = _ff(imu.gyroscope[j], 6)
             for j, name in enumerate(['x', 'y', 'z']):
-                row[f'imu_acc_{name}'] = round(float(imu.accelerometer[j]), 6)
+                row[f'imu_acc_{name}'] = _ff(imu.accelerometer[j], 6)
             for j, name in enumerate(['r', 'p', 'y']):
-                row[f'imu_rpy_{name}'] = round(float(imu.rpy[j]), 6)
+                row[f'imu_rpy_{name}'] = _ff(imu.rpy[j], 6)
         else:
             for name in ['imu_quat_w', 'imu_quat_x', 'imu_quat_y', 'imu_quat_z',
                           'imu_gyro_x', 'imu_gyro_y', 'imu_gyro_z',
@@ -154,8 +169,10 @@ class Recorder:
             m: dict = {'name': MOTOR_NAMES[i]}
             if cmd is not None:
                 mc = cmd.motor_cmd[i]
-                m['cmd_q'] = round(float(mc.q), 4)
-                m['cmd_dq'] = round(float(mc.dq), 4)
+                q_raw = float(mc.q)
+                dq_raw = float(mc.dq)
+                m['cmd_q'] = 0.0 if q_raw == POS_STOP_F else round(q_raw, 4)
+                m['cmd_dq'] = 0.0 if dq_raw == VEL_STOP_F else round(dq_raw, 4)
                 m['cmd_tau'] = round(float(mc.tau), 4)
                 m['cmd_kp'] = round(float(mc.kp), 2)
                 m['cmd_kd'] = round(float(mc.kd), 2)

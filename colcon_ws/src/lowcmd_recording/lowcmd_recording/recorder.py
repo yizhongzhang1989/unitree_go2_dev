@@ -63,6 +63,13 @@ class Recorder:
         self._csv_path: str = ''
         self._xlsx_path: str = ''
 
+        # Frequency measurement
+        self._cmd_count: int = 0
+        self._state_count: int = 0
+        self._freq_t0: float = _time.monotonic()
+        self._cmd_hz: float = 0.0
+        self._state_hz: float = 0.0
+
         # Initialise Unitree SDK2 DDS channel
         ChannelFactoryInitialize(0, network_interface)
 
@@ -81,12 +88,25 @@ class Recorder:
     def _on_cmd(self, msg: object) -> None:
         with self._lock:
             self._latest_cmd = msg
+            self._cmd_count += 1
 
     def _on_state(self, msg: object) -> None:
         with self._lock:
             self._latest_state = msg
+            self._state_count += 1
             if self._recording:
                 self._record_frame()
+
+    def _update_freq(self) -> None:
+        """Compute Hz from counts accumulated since last call. Must hold self._lock."""
+        now = _time.monotonic()
+        dt = now - self._freq_t0
+        if dt >= 1.0:
+            self._cmd_hz = round(self._cmd_count / dt, 1)
+            self._state_hz = round(self._state_count / dt, 1)
+            self._cmd_count = 0
+            self._state_count = 0
+            self._freq_t0 = now
 
     def _record_frame(self) -> None:
         """Append one row combining cmd + state. Must hold self._lock."""
@@ -170,10 +190,18 @@ class Recorder:
     def get_snapshot(self) -> dict:
         """Return latest cmd + state as a JSON-friendly dict."""
         with self._lock:
+            self._update_freq()
             cmd = self._latest_cmd
             state = self._latest_state
+            cmd_hz = self._cmd_hz
+            state_hz = self._state_hz
 
-        result: dict = {'motors': [], 'connected': cmd is not None or state is not None}
+        result: dict = {
+            'motors': [],
+            'connected': cmd is not None or state is not None,
+            'cmd_hz': cmd_hz,
+            'state_hz': state_hz,
+        }
         for i in range(12):
             m: dict = {'name': MOTOR_NAMES[i]}
             if cmd is not None:

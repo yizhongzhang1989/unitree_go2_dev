@@ -58,6 +58,11 @@
 <div class="status-bar">
   <span class="dot" id="conn-dot"></span>
   <span id="conn-txt">Connecting…</span>
+  <span style="margin-left:auto; font-size:12px;">
+    <span style="color:var(--yellow)">cmd</span> <span id="cmd-hz">—</span> Hz
+    &nbsp;|&nbsp;
+    <span style="color:var(--accent)">state</span> <span id="state-hz">—</span> Hz
+  </span>
 </div>
 
 <!-- Recording controls -->
@@ -148,6 +153,14 @@ function connect() {
 connect();
 
 function onData(s) {
+  // Frequency display
+  var cmdHz = document.getElementById('cmd-hz');
+  var stateHz = document.getElementById('state-hz');
+  cmdHz.textContent = s.cmd_hz != null ? s.cmd_hz.toFixed(1) : '—';
+  stateHz.textContent = s.state_hz != null ? s.state_hz.toFixed(1) : '—';
+  cmdHz.style.color = s.cmd_hz > 0 ? 'var(--green)' : 'var(--muted)';
+  stateHz.style.color = s.state_hz > 0 ? 'var(--green)' : 'var(--muted)';
+
   var motors = s.motors || [];
   for (var i = 0; i < motors.length; i++) {
     var m = motors[i];

@@ -24,6 +24,10 @@ from common.config import load_config
 
 
 def main(args=None) -> None:
+    # Reduce the GIL switch interval from the default 5 ms to 0.5 ms so the
+    # 500 Hz control thread is never starved by uvicorn for more than 0.5 ms.
+    sys.setswitchinterval(0.0005)
+
     # Strip ROS2 argument block so argparse doesn't choke on it.
     argv = list(args or sys.argv[1:])
     if '--ros-args' in argv:
@@ -59,11 +63,8 @@ def main(args=None) -> None:
     svc_poller = _ServicePoller(network_interface=parsed.network_interface)
     set_service_poller(svc_poller)
 
-    # Spin rclpy in a daemon background thread so uvicorn can own the main thread.
-    spin_thread = threading.Thread(
-        target=rclpy.spin, args=(node,), daemon=True, name='rclpy_spin'
-    )
-    spin_thread.start()
+    # rclpy callbacks are processed inside the node's control loop thread
+    # (spin_once integrated with _publish_cmd) to avoid GIL contention.
 
     print(
         f'[low_level_control_web] Dashboard →  '

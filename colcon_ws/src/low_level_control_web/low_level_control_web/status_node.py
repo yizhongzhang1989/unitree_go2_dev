@@ -38,11 +38,14 @@ _SDK_ENV = {
 POS_STOP_F: float = 2.146e9
 VEL_STOP_F: float = 16000.0
 
+# Pre-cached CRC computation objects (avoids per-call import + instantiation).
+from unitree_sdk2py.utils.crc import CRC as _CRC
+_crc_inst = _CRC()
+_CRC_PACK_FMT = '<4B4IH2x' + 'B3x5f3I' * 20 + '4B' + '55Bx2I'
+
 
 def _compute_crc(cmd: LowCmd) -> int:
     """Compute CRC32 over a ROS2 LowCmd message (identical layout to Unitree IDL)."""
-    from unitree_sdk2py.utils.crc import CRC
-    pack_fmt = '<4B4IH2x' + 'B3x5f3I' * 20 + '4B' + '55Bx2I'
     d: list = []
     d.extend(cmd.head)
     d.append(cmd.level_flag)
@@ -51,13 +54,14 @@ def _compute_crc(cmd: LowCmd) -> int:
     d.extend(cmd.version)
     d.append(cmd.bandwidth)
     for i in range(20):
-        d.append(cmd.motor_cmd[i].mode)
-        d.append(cmd.motor_cmd[i].q)
-        d.append(cmd.motor_cmd[i].dq)
-        d.append(cmd.motor_cmd[i].tau)
-        d.append(cmd.motor_cmd[i].kp)
-        d.append(cmd.motor_cmd[i].kd)
-        d.extend(cmd.motor_cmd[i].reserve)
+        mc = cmd.motor_cmd[i]
+        d.append(mc.mode)
+        d.append(mc.q)
+        d.append(mc.dq)
+        d.append(mc.tau)
+        d.append(mc.kp)
+        d.append(mc.kd)
+        d.extend(mc.reserve)
     d.append(cmd.bms_cmd.off)
     d.extend(cmd.bms_cmd.reserve)
     d.extend(cmd.wireless_remote)
@@ -66,14 +70,14 @@ def _compute_crc(cmd: LowCmd) -> int:
     d.append(cmd.gpio)
     d.append(cmd.reserve)
     d.append(cmd.crc)
-    packed = struct.pack(pack_fmt, *d)
+    packed = struct.pack(_CRC_PACK_FMT, *d)
     calc_len = (len(packed) >> 2) - 1
     calc_data = [
         (packed[i*4+3] << 24) | (packed[i*4+2] << 16) |
         (packed[i*4+1] <<  8) |  packed[i*4]
         for i in range(calc_len)
     ]
-    return CRC()._crc_ctypes(calc_data)
+    return _crc_inst._crc_ctypes(calc_data)
 
 
 class ControlNode(Node):
@@ -84,6 +88,8 @@ class ControlNode(Node):
         self._network_interface = network_interface
         self._lock = threading.Lock()
         self._latest_status: Optional[dict] = None
+        # Raw LowState for fast feedback in the control loop (no dict conversion).
+        self._latest_state_raw: Optional[LowState] = None
 
         # Per-motor control targets. All disabled by default (safe idle).
         self._motor_cmds: list[dict] = [
@@ -135,6 +141,18 @@ class ControlNode(Node):
         self.create_subscription(LowState, '/lowstate', self._state_cb, 10)
         self._cmd_pub = self.create_publisher(LowCmd, '/lowcmd', 10)
 
+        # Pre-allocated LowCmd reused every tick (avoids 21 object constructions).
+        self._cmd_msg = LowCmd()
+        self._cmd_msg.head = [0xFE, 0xEF]
+        self._cmd_msg.level_flag = 0xFF
+        self._cmd_msg.gpio = 0
+        for i in range(20):
+            self._cmd_msg.motor_cmd[i].mode = 0x01
+        # Motors 12-19 are unused; set safe idle once (never touched in the loop).
+        for i in range(12, 20):
+            self._cmd_msg.motor_cmd[i].q = POS_STOP_F
+            self._cmd_msg.motor_cmd[i].dq = VEL_STOP_F
+
         # Control loop runs in a background thread; frequency controlled by _ctrl_freq.
         self._stop_event = threading.Event()
         self._ctrl_thread = threading.Thread(
@@ -149,12 +167,17 @@ class ControlNode(Node):
     # ------------------------------------------------------------------
 
     def _state_cb(self, msg: LowState) -> None:
-        payload = lowstate_to_dict(msg)
         with self._lock:
-            self._latest_status = payload
+            self._latest_state_raw = msg
+            # Invalidate cached dict so get_latest_status() rebuilds it lazily.
+            self._latest_status = None
 
     def _publish_cmd(self) -> None:
-        """Build and publish a LowCmd reflecting current control state."""
+        """Build and publish a LowCmd reflecting current control state.
+
+        Uses the pre-allocated ``self._cmd_msg`` and reads motor feedback
+        directly from the raw ``LowState`` to avoid dict conversion overhead.
+        """
         with self._lock:
             if not self._publishing_active:
                 return
@@ -163,7 +186,7 @@ class ControlNode(Node):
             drag_en = list(self._drag_enabled)
             drag_lim = list(self._drag_tau_limit)
             dtorque = list(self._direct_torque)
-            status = self._latest_status
+            raw_state = self._latest_state_raw
             # Playback: interpolate q, dq (and optionally tau, kp, kd) by elapsed time
             pb_active = self._playback_active
             if pb_active:
@@ -187,26 +210,19 @@ class ControlNode(Node):
                                 cmds[i]['kd'] = kd_i
 
         # Drag mode: update position targets for joints where |tau_est| > limit
-        if status is not None:
-            motors_fb = status.get('motors', [])
-            for i in range(min(12, len(motors_fb))):
+        # Read motor feedback directly from the raw LowState (no dict conversion).
+        if raw_state is not None:
+            for i in range(12):
+                ms = raw_state.motor_state[i]
                 if cmds[i]['enabled'] and drag_en[i]:
-                    tau_est = motors_fb[i].get('tau_est')
-                    q_act   = motors_fb[i].get('q')
-                    if tau_est is not None and q_act is not None:
-                        if abs(tau_est) > drag_lim[i]:
-                            # Yield: move target to actual position
-                            cmds[i]['q'] = float(q_act)
+                    tau_est = float(ms.tau_est)
+                    if abs(tau_est) > drag_lim[i]:
+                        cmds[i]['q'] = float(ms.q)
 
-        cmd = LowCmd()
-        cmd.head = [0xFE, 0xEF]
-        cmd.level_flag = 0xFF
-        cmd.gpio = 0
-
-        for i in range(20):
-            mc = MotorCmd()
-            mc.mode = 0x01
-            if i < 12 and not estop and cmds[i]['enabled']:
+        cmd = self._cmd_msg
+        for i in range(12):
+            mc = cmd.motor_cmd[i]
+            if not estop and cmds[i]['enabled']:
                 c      = cmds[i]
                 kp_val = float(c['kp'])
                 kd_val = float(c['kd'])
@@ -217,11 +233,9 @@ class ControlNode(Node):
                 if dtorque[i]:
                     q_act  = 0.0
                     dq_act = 0.0
-                    if status is not None:
-                        mfb = status.get('motors', [])
-                        if i < len(mfb):
-                            q_act  = float(mfb[i].get('q', 0.0))
-                            dq_act = float(mfb[i].get('dq', 0.0))
+                    if raw_state is not None:
+                        q_act  = float(raw_state.motor_state[i].q)
+                        dq_act = float(raw_state.motor_state[i].dq)
                     tau_val = tau_val + kp_val * (float(c['q']) - q_act) + kd_val * (float(c['dq']) - dq_act)
                     mc.q   = POS_STOP_F
                     mc.dq  = VEL_STOP_F
@@ -234,7 +248,7 @@ class ControlNode(Node):
                     mc.tau = tau_val
                     mc.kp  = kp_val
                     mc.kd  = kd_val
-            elif i < 12 and estop:
+            elif estop:
                 mc.q   = POS_STOP_F
                 mc.dq  = VEL_STOP_F
                 mc.tau = 0.0
@@ -246,7 +260,7 @@ class ControlNode(Node):
                 mc.tau = 0.0
                 mc.kp  = 0.0
                 mc.kd  = 0.0
-            cmd.motor_cmd[i] = mc
+        # Motors 12-19 are set once in __init__ and never change.
 
         with self._lock:
             for i in range(12):
@@ -268,7 +282,17 @@ class ControlNode(Node):
 
     def get_latest_status(self) -> Optional[dict]:
         with self._lock:
-            return self._latest_status
+            if self._latest_status is not None:
+                return self._latest_status
+            raw = self._latest_state_raw
+        if raw is None:
+            return None
+        # Lazy conversion: only happens at web-broadcast rate (~10 Hz),
+        # not at the 500 Hz callback rate.
+        result = lowstate_to_dict(raw)
+        with self._lock:
+            self._latest_status = result
+        return result
 
     def set_freq(self, freq: float) -> None:
         """Set the control loop publish frequency (1–500 Hz)."""
@@ -570,25 +594,72 @@ class ControlNode(Node):
                 self._mode_state = 'error'
             self.get_logger().error(f'Mode restore failed: {e}')
 
+    # Guard band: switch from spin_once (imprecise) to busy-wait (precise)
+    # when the remaining time falls below this threshold.  Must cover
+    # spin_once jitter (~0.3 ms) + GIL reacquisition latency (~0.5 ms).
+    _BUSY_WAIT_SEC: float = 0.0008  # 0.8 ms
+
     def _control_loop(self) -> None:
-        """Background thread: calls _publish_cmd at the configured frequency."""
-        import time as _time
-        last_freq = -1.0
-        next_deadline = _time.monotonic()
-        while not self._stop_event.is_set():
-            with self._lock:
-                freq = max(1.0, self._ctrl_freq)
-            dt = 1.0 / freq
-            if freq != last_freq:
-                next_deadline = _time.monotonic()
-                last_freq = freq
-            self._publish_cmd()
-            next_deadline += dt
-            sleep_for = next_deadline - _time.monotonic()
-            if sleep_for > 0:
-                _time.sleep(sleep_for)
-            else:
-                next_deadline = _time.monotonic()
+        """Background thread: spins ROS callbacks and publishes at target frequency.
+
+        Uses a single-threaded executor so that /lowstate callbacks and /lowcmd
+        publishing share one thread, eliminating GIL contention.  During the
+        idle interval between ticks we process ROS callbacks via spin_once,
+        then switch to busy-wait for the final fraction to ensure stable timing.
+
+        When a tick overshoots by less than one period the phase is kept so the
+        next tick compensates automatically, maintaining the correct average
+        frequency.  Only resets the phase when more than one full period behind.
+        """
+        import os
+        from rclpy.executors import SingleThreadedExecutor
+
+        # Try to elevate this thread to real-time scheduling for stable timing.
+        try:
+            os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(50))
+            self.get_logger().info('Control thread elevated to SCHED_RR priority 50')
+        except PermissionError:
+            self.get_logger().warn(
+                'Cannot set RT scheduling (not root). '
+                'Run with sudo or set CAP_SYS_NICE for best timing.'
+            )
+
+        executor = SingleThreadedExecutor()
+        executor.add_node(self)
+        _mono = _time.monotonic  # local lookup for speed
+        busy_thresh = self._BUSY_WAIT_SEC
+        try:
+            last_freq = -1.0
+            next_deadline = _mono()
+            while not self._stop_event.is_set():
+                with self._lock:
+                    freq = max(1.0, self._ctrl_freq)
+                dt = 1.0 / freq
+                if freq != last_freq:
+                    next_deadline = _mono()
+                    last_freq = freq
+                self._publish_cmd()
+                next_deadline += dt
+                # Coarse wait: process ROS callbacks while there is enough slack.
+                remaining = next_deadline - _mono()
+                while remaining > busy_thresh:
+                    executor.spin_once(timeout_sec=remaining - busy_thresh)
+                    remaining = next_deadline - _mono()
+                # Fine wait: busy-spin for the last fraction of a ms.
+                if remaining > 0:
+                    while _mono() < next_deadline:
+                        pass
+                elif remaining > -dt:
+                    # Small miss (< 1 period): keep phase so the next tick
+                    # will have a shorter wait, maintaining average frequency.
+                    executor.spin_once(timeout_sec=0)
+                else:
+                    # Way behind (> 1 full period): reset phase to avoid
+                    # a burst of zero-sleep catch-up ticks.
+                    executor.spin_once(timeout_sec=0)
+                    next_deadline = _mono()
+        finally:
+            executor.remove_node(self)
 
     def get_mode_state(self) -> dict:
         with self._lock:

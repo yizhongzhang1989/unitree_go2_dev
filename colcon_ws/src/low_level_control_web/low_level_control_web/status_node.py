@@ -133,6 +133,7 @@ class ControlNode(Node):
         self._playback_t0: float = 0.0       # monotonic start time
         self._playback_duration: float = 0.0 # total duration of loaded trajectory
         self._playback_loaded: bool = False   # whether a trajectory is loaded
+        self._playback_csv_text: str | None = None  # raw CSV for re-parse
         # Per-motor trajectory: list of 12, each a list of
         # (time, q, dq, tau|None, kp|None, kd|None) tuples sorted by time.
         self._playback_traj: list[list[tuple]] = [[] for _ in range(12)]
@@ -443,6 +444,7 @@ class ControlNode(Node):
             self._playback_duration = duration
             self._playback_loaded = True
             self._playback_active = False
+            self._playback_csv_text = csv_text
         n_frames = len(rows)
         self.get_logger().info(f'Playback trajectory loaded: {n_frames} frames, {duration:.2f}s')
         return {'ok': True, 'duration': round(duration, 3), 'frames': n_frames}

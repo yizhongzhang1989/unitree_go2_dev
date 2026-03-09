@@ -271,6 +271,34 @@ async def api_playback_upload(
     return JSONResponse(result)
 
 
+@app.post('/api/playback/reparse', response_class=JSONResponse)
+async def api_playback_reparse(
+    q_source: str = Form('cmd'),
+    dq_source: str = Form('cmd'),
+    track_tau: str = Form('false'),
+    track_kp: str = Form('false'),
+    track_kd: str = Form('false'),
+) -> JSONResponse:
+    if _status_capture is None:
+        return JSONResponse({'error': 'not ready'}, status_code=503)
+    with _status_capture._lock:
+        csv_text = _status_capture._playback_csv_text
+    if csv_text is None:
+        return JSONResponse({'ok': False, 'error': 'no CSV loaded'}, status_code=400)
+    try:
+        result = _status_capture.load_playback_csv(
+            csv_text,
+            q_source=q_source,
+            dq_source=dq_source,
+            track_tau=track_tau.lower() == 'true',
+            track_kp=track_kp.lower() == 'true',
+            track_kd=track_kd.lower() == 'true',
+        )
+    except (ValueError, KeyError, Exception) as exc:
+        return JSONResponse({'ok': False, 'error': str(exc)}, status_code=400)
+    return JSONResponse(result)
+
+
 @app.post('/api/playback/start', response_class=JSONResponse)
 async def api_playback_start() -> JSONResponse:
     if _status_capture is None:

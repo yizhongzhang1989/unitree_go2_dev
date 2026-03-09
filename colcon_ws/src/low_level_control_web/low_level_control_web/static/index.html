@@ -546,11 +546,11 @@
       <div class="btn-row" style="flex-direction:column;gap:10px;">
         <!-- Options -->
         <div style="font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;">
-          <label>q: <select id="pb-q-src"><option value="cmd" selected>cmd_q</option><option value="state">state_q</option></select></label>
-          <label>dq: <select id="pb-dq-src"><option value="cmd" selected>cmd_dq</option><option value="state">state_dq</option></select></label>
-          <label><input type="checkbox" id="pb-tau"> tau</label>
-          <label><input type="checkbox" id="pb-kp"> Kp</label>
-          <label><input type="checkbox" id="pb-kd"> Kd</label>
+          <label>q: <select id="pb-q-src" onchange="reparsePlayback()"><option value="cmd" selected>cmd_q</option><option value="state">state_q</option></select></label>
+          <label>dq: <select id="pb-dq-src" onchange="reparsePlayback()"><option value="cmd" selected>cmd_dq</option><option value="state">state_dq</option></select></label>
+          <label><input type="checkbox" id="pb-tau" onchange="reparsePlayback()"> tau</label>
+          <label><input type="checkbox" id="pb-kp" onchange="reparsePlayback()"> Kp</label>
+          <label><input type="checkbox" id="pb-kd" onchange="reparsePlayback()"> Kd</label>
         </div>
         <input type="file" id="csv-file" accept=".csv" onchange="uploadCSV(this)">
         <button id="upload-btn" onclick="document.getElementById('csv-file').click()">&#128194; Upload CSV</button>
@@ -1395,6 +1395,24 @@ function uploadCSV(input) {
     })
     .catch(e => alert('Upload error: ' + e));
   input.value = '';  // allow re-upload of same file
+}
+function reparsePlayback() {
+  if (!_playbackLoaded) return;
+  var fd = new FormData();
+  fd.append('q_source',  document.getElementById('pb-q-src').value);
+  fd.append('dq_source', document.getElementById('pb-dq-src').value);
+  fd.append('track_tau', document.getElementById('pb-tau').checked);
+  fd.append('track_kp',  document.getElementById('pb-kp').checked);
+  fd.append('track_kd',  document.getElementById('pb-kd').checked);
+  fetch('/api/playback/reparse', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(j => {
+      if (j.ok) {
+        var info = document.getElementById('pb-info');
+        info.textContent = 'Loaded: ' + j.frames + ' frames, ' + j.duration.toFixed(1) + 's';
+      }
+    })
+    .catch(() => {});
 }
 function togglePlayback() {
   if (_isPlaying) {
